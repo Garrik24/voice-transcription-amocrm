@@ -18,8 +18,6 @@ from services.amocrm import amocrm_service
 from services.transcription import transcription_service
 from services.analysis import analysis_service
 from services.telegram import telegram_service
-from automations.geodesist_notification.handler import notify_geodesist
-from automations.geodesist_notification.types import GeodesistWebhookPayload
 
 # Настраиваем логирование
 logging.basicConfig(
@@ -427,75 +425,6 @@ async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
         
     except Exception as e:
         logger.error(f"❌ Webhook ошибка: {e}")
-        return JSONResponse(content={"status": "error"}, status_code=200)
-
-
-@app.post("/webhook/amocrm/geodesist-assigned")
-async def geodesist_assigned_webhook(request: Request, background_tasks: BackgroundTasks):
-    """
-    Webhook от робота AmoCRM на этапе "Назначен".
-    Ожидаем минимум: lead_id + (geodesist или geodesist_phone).
-
-    Поддерживаем JSON и form-urlencoded.
-    """
-    try:
-        content_type = (request.headers.get("content-type") or "").lower()
-
-        lead_id = None
-        geodesist = None
-        geodesist_phone = None
-        work_type = None
-        address = None
-        time_slot = None
-        client_name = None
-        client_phone = None
-
-        if "application/json" in content_type:
-            body = await request.json()
-            lead_id = body.get("lead_id") or body.get("leadId") or body.get("id")
-            geodesist = body.get("geodesist")
-            geodesist_phone = body.get("geodesist_phone") or body.get("geodesistPhone")
-            work_type = body.get("work_type") or body.get("workType")
-            address = body.get("address")
-            time_slot = body.get("time_slot") or body.get("timeSlot")
-            client_name = body.get("client_name") or body.get("clientName")
-            client_phone = body.get("client_phone") or body.get("clientPhone")
-        else:
-            form = await request.form()
-            body = dict(form)
-            lead_id = body.get("lead_id") or body.get("leadId") or body.get("id")
-            geodesist = body.get("geodesist")
-            geodesist_phone = body.get("geodesist_phone") or body.get("geodesistPhone")
-            work_type = body.get("work_type") or body.get("workType")
-            address = body.get("address")
-            time_slot = body.get("time_slot") or body.get("timeSlot")
-            client_name = body.get("client_name") or body.get("clientName")
-            client_phone = body.get("client_phone") or body.get("clientPhone")
-
-        if lead_id is None:
-            return JSONResponse(content={"status": "error", "reason": "lead_id_required"}, status_code=200)
-
-        try:
-            lead_id_int = int(str(lead_id).strip())
-        except Exception:
-            return JSONResponse(content={"status": "error", "reason": "lead_id_invalid"}, status_code=200)
-
-        payload = GeodesistWebhookPayload(
-            lead_id=lead_id_int,
-            geodesist=str(geodesist).strip() if geodesist is not None else None,
-            geodesist_phone=str(geodesist_phone).strip() if geodesist_phone is not None else None,
-            work_type=str(work_type).strip() if work_type is not None else None,
-            address=str(address).strip() if address is not None else None,
-            time_slot=str(time_slot).strip() if time_slot is not None else None,
-            client_name=str(client_name).strip() if client_name is not None else None,
-            client_phone=str(client_phone).strip() if client_phone is not None else None,
-        )
-
-        background_tasks.add_task(notify_geodesist, payload)
-        return JSONResponse(content={"status": "processing", "lead_id": lead_id_int}, status_code=200)
-
-    except Exception as e:
-        logger.error(f"❌ Геодезист webhook ошибка: {e}")
         return JSONResponse(content={"status": "error"}, status_code=200)
 
 
