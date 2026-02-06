@@ -2,6 +2,7 @@
 Сервис для работы с AmoCRM API.
 Получение данных о звонках и сохранение примечаний.
 """
+import asyncio
 import httpx
 import ssl
 import logging
@@ -9,11 +10,6 @@ from typing import Optional, Dict, Any
 from config import AMOCRM_DOMAIN, AMOCRM_ACCESS_TOKEN, MANAGERS
 
 logger = logging.getLogger(__name__)
-
-# SSL контекст с отключенной проверкой (для серверов с проблемными сертификатами)
-ssl_context = ssl.create_default_context()
-ssl_context.check_hostname = False
-ssl_context.verify_mode = ssl.CERT_NONE
 
 
 class AmoCRMService:
@@ -292,10 +288,6 @@ class AmoCRMService:
         Returns:
             Бинарные данные аудиофайла
         """
-        import ssl
-        import httpx
-        import asyncio
-        
         logger.info(f"📥 Скачиваем запись: {url[:80]}...")
         
         # Создаём SSL контекст, который полностью игнорирует проверку сертификатов
@@ -434,7 +426,7 @@ class AmoCRMService:
                     try:
                         error_json = response.json()
                         logger.error(f"AmoCRM вернул 400 для {entity_type}/{entity_id}: {error_json}")
-                    except:
+                    except (ValueError, Exception):
                         logger.error(f"AmoCRM вернул 400 для {entity_type}/{entity_id}: {error_text}")
                     # Пробуем получить больше информации об ошибке
                     logger.error(f"Запрос был: POST {self.base_url}/{entity_type}/{entity_id}/notes")

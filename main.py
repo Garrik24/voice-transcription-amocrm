@@ -8,12 +8,12 @@ FastAPI сервер с webhook endpoint для AmoCRM.
 import logging
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, File, Form, UploadFile
 from fastapi.responses import JSONResponse
-import httpx
 
-from config import PORT, DEBUG, validate_config
+from config import PORT, DEBUG, AMOCRM_DOMAIN, validate_config
 from services.amocrm import amocrm_service
 from services.transcription import transcription_service
 from services.analysis import analysis_service
@@ -96,9 +96,6 @@ async def process_call(
     Основная функция обработки звонка.
     Выполняется в фоновом режиме.
     """
-    from datetime import datetime
-    from config import AMOCRM_DOMAIN
-    
     try:
         # 0. Проверяем дубликаты
         if await is_already_processed(record_url):
@@ -233,8 +230,6 @@ async def process_call(
         
         # 8. Отправляем красивый анализ в Telegram
         # Время: Railway работает в UTC, для Москвы всегда +3 часа.
-        from datetime import timedelta
-
         if call_created_at:
             ts = int(call_created_at)
             if ts > 10**12:
@@ -328,14 +323,14 @@ async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
             if "[note][id]" in key and value:
                 try:
                     note_id = int(value)
-                except:
+                except (ValueError, TypeError):
                     pass
             
             # Ищем element_id - ID сущности (контакта/сделки)
             if "[note][element_id]" in key and value:
                 try:
                     element_id = int(value)
-                except:
+                except (ValueError, TypeError):
                     pass
             
             # Определяем тип сущности
@@ -352,7 +347,7 @@ async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
             if "[note][responsible_user_id]" in key and value:
                 try:
                     responsible_user_id = int(value)
-                except:
+                except (ValueError, TypeError):
                     pass
         
         # 3. Если это не примечание - игнорируем (не спамим в лог)
@@ -417,7 +412,6 @@ async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
         
         # 9. Запускаем обработку в фоне
         raw_created_at = note_data.get("created_at")
-        logger.info(f"🕐 DEBUG: note_data created_at={raw_created_at} (type={type(raw_created_at).__name__})")
         background_tasks.add_task(
             process_call,
             entity_id=element_id,
@@ -505,7 +499,6 @@ async def geodesist_assigned_webhook(request: Request, background_tasks: Backgro
         return JSONResponse(content={"status": "error"}, status_code=200)
 
 
-
 @app.post("/upload-audio")
 async def upload_audio(
     background_tasks: BackgroundTasks,
@@ -574,9 +567,6 @@ async def process_uploaded_audio(
     call_created_at: Optional[int] = None,
 ):
     """Обработка загруженного аудио (без скачивания)"""
-    from datetime import datetime
-    from config import AMOCRM_DOMAIN
-    
     try:
         logger.info(f"📞 Обработка загруженного аудио для сделки #{lead_id}")
         
@@ -638,8 +628,6 @@ async def process_uploaded_audio(
         
         # 6. Отправляем красивый анализ в Telegram
         # Время: Railway работает в UTC, для Москвы всегда +3 часа.
-        from datetime import timedelta
-
         if call_created_at:
             ts = int(call_created_at)
             if ts > 10**12:

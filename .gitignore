@@ -22,9 +22,10 @@ env/
 dist/
 build/
 
-# IDE
+# IDE / tool configs
 .idea/
 .vscode/
+.serena/
 *.swp
 *.swo
 
@@ -36,3 +37,22 @@ logs/
 *.tmp
 *.temp
 .DS_Store
+
+# Separate project (has its own repo)
+geodesist-max/
+
+# Manual integration test (requires live API keys)
+test_automation.py
+
+# Auto-generated docs / changelogs (not source code)
+AGENT_INSTRUCTIONS.md
+AI_SETTINGS_GUIDE.md
+CHANGELOG_*.md
+DEPLOY_VALIDATOR.md
+DOCUMENTATION_SUMMARY.md
+INSTALLATION_GUIDE.md
+PROCESS_FLOW.md
+QUICK_START.md
+TIMEZONE_FIX.md
+UPDATE_SUMMARY.md
+VALIDATOR_GUIDE.md

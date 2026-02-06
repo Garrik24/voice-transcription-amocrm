@@ -104,8 +104,7 @@ class TelegramService:
         client_name: str,
         summary: str,
         amocrm_url: str,
-        record_url: str = ""
-        ,
+        record_url: str = "",
         client_city: str = "Не указано",
         work_type: str = "Консультация",
         cost: str = "Не обсуждали",
@@ -118,8 +117,6 @@ class TelegramService:
         Отправляет красивый анализ звонка в Telegram.
         Формат как в Make.com автоматизации.
         """
-        from datetime import datetime
-        
         call_type_str = "Входящий" if call_type == "incoming" else "Исходящий"
 
         steps_block = ""

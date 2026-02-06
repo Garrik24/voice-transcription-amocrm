@@ -5,3 +5,28 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Separate project — has its own Railway service
+geodesist-max/
+
+# IDE / tool configs
+.serena/
+.idea/
+.vscode/
+
+# Manual test script (requires secrets, not for prod)
+test_automation.py
+
+# Documentation — not needed in build
+AGENT_INSTRUCTIONS.md
+AI_SETTINGS_GUIDE.md
+CHANGELOG_*.md
+DEPLOY_VALIDATOR.md
+DOCUMENTATION_SUMMARY.md
+INSTALLATION_GUIDE.md
+PROCESS_FLOW.md
+QUICK_START.md
+TIMEZONE_FIX.md
+UPDATE_SUMMARY.md
+VALIDATOR_GUIDE.md
+PLAN.md
