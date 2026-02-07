@@ -488,7 +488,16 @@ class AnalysisService:
                 )
 
                 result_text = response.text or ""
-                result_json = json.loads(result_text)
+                if not result_text.strip():
+                    logger.error("Gemini вернул пустой ответ")
+                    raise ValueError("Пустой ответ от Gemini")
+                    
+                try:
+                    result_json = json.loads(result_text)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Ошибка парсинга JSON от Gemini: {e}")
+                    logger.error(f"Сырой ответ ({len(result_text)} символов): {result_text[:500]}...")
+                    raise
 
             else:
                 client = _get_client()
