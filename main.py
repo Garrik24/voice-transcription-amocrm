@@ -26,6 +26,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Безопасность: подавляем подробные логи HTTP-клиента (могут содержать токены в URL).
+# Например, Telegram API использует URL вида /bot<TOKEN>/sendMessage — в INFO/DEBUG это утечка.
+for _logger_name in ("httpx", "httpcore"):
+    logging.getLogger(_logger_name).setLevel(logging.WARNING)
+
 # Кэш обработанных звонков, чтобы избежать дублей и петель
 # В продакшене лучше использовать Redis, но для начала хватит и Set в памяти
 PROCESSED_CALLS = set()
