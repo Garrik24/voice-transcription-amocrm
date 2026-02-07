@@ -495,6 +495,15 @@ class AnalysisService:
                         )
 
                         result_text = response.text or ""
+                        
+                        # #region agent log - DEBUG: capture raw Gemini response
+                        logger.info(f"🔬 [H1] Gemini raw first 100 chars: {repr(result_text[:100]) if result_text else 'EMPTY'}")
+                        logger.info(f"🔬 [H2] starts_with_brace={result_text.startswith('{') if result_text else False}, len={len(result_text) if result_text else 0}")
+                        logger.info(f"🔬 [H3] has_markdown={'```' in result_text if result_text else False}")
+                        if result_text and len(result_text) > 100:
+                            logger.info(f"🔬 [H5] last 100 chars: {repr(result_text[-100:])}")
+                        # #endregion
+                        
                         if not result_text.strip():
                             raise ValueError("Пустой ответ от Gemini")
                         
@@ -505,6 +514,10 @@ class AnalysisService:
                         
                     except (json.JSONDecodeError, ValueError) as e:
                         last_error = e
+                        # #region agent log - DEBUG: capture parse error
+                        logger.error(f"🔬 [ERROR] JSON parse failed: {type(e).__name__}: {e}")
+                        logger.error(f"🔬 [ERROR] Full raw response: {repr(result_text[:500]) if result_text else 'NO_RESPONSE'}")
+                        # #endregion
                         logger.warning(f"⚠️ Gemini попытка {attempt + 1}/{max_retries}: {e}")
                         if hasattr(response, 'text') and response.text:
                             logger.warning(f"Сырой ответ ({len(response.text)} символов): {response.text[:500]}...")
