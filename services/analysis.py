@@ -476,28 +476,49 @@ class AnalysisService:
                     )
                 )
 
-                response = await gemini.aio.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=ANALYSIS_TEMPERATURE,
-                        max_output_tokens=max_output_tokens,
-                        response_mime_type="application/json",
-                        response_schema=response_schema,
-                    ),
-                )
+                # Retry логика для Gemini (2 попытки)
+                max_retries = 2
+                last_error = None
+                result_json = None
+                
+                for attempt in range(max_retries):
+                    try:
+                        response = await gemini.aio.models.generate_content(
+                            model=GEMINI_MODEL,
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                temperature=ANALYSIS_TEMPERATURE,
+                                max_output_tokens=max_output_tokens,
+                                response_mime_type="application/json",
+                                response_schema=response_schema,
+                            ),
+                        )
 
-                result_text = response.text or ""
-                if not result_text.strip():
-                    logger.error("Gemini вернул пустой ответ")
-                    raise ValueError("Пустой ответ от Gemini")
-                    
-                try:
-                    result_json = json.loads(result_text)
-                except json.JSONDecodeError as e:
-                    logger.error(f"Ошибка парсинга JSON от Gemini: {e}")
-                    logger.error(f"Сырой ответ ({len(result_text)} символов): {result_text[:500]}...")
-                    raise
+                        result_text = response.text or ""
+                        if not result_text.strip():
+                            raise ValueError("Пустой ответ от Gemini")
+                        
+                        result_json = json.loads(result_text)
+                        if attempt > 0:
+                            logger.info(f"✅ Gemini успешно ответил с попытки {attempt + 1}")
+                        break  # Успех — выходим из цикла
+                        
+                    except (json.JSONDecodeError, ValueError) as e:
+                        last_error = e
+                        logger.warning(f"⚠️ Gemini попытка {attempt + 1}/{max_retries}: {e}")
+                        if hasattr(response, 'text') and response.text:
+                            logger.warning(f"Сырой ответ ({len(response.text)} символов): {response.text[:500]}...")
+                        
+                        if attempt < max_retries - 1:
+                            logger.info("🔄 Повторяем запрос к Gemini...")
+                            import asyncio
+                            await asyncio.sleep(1)  # Небольшая пауза перед retry
+                        else:
+                            logger.error(f"❌ Gemini не вернул валидный JSON после {max_retries} попыток")
+                            raise
+                
+                if result_json is None:
+                    raise last_error or ValueError("Не удалось получить ответ от Gemini")
 
             else:
                 client = _get_client()
