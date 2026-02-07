@@ -45,14 +45,16 @@ class TranscriptionService:
     async def transcribe_audio(
         self, 
         audio_data: bytes,
-        language_code: str = "ru"
+        language_code: str = "ru",
+        speaker_labels: bool = True,
     ) -> TranscriptionResult:
         """
-        Транскрибирует аудио с диаризацией.
+        Транскрибирует аудио (опционально с диаризацией).
         
         Args:
             audio_data: Бинарные данные аудиофайла
             language_code: Код языка (ru, en, etc.)
+            speaker_labels: Включить диаризацию (speaker labels)
             
         Returns:
             Результат транскрибации с разделением по говорящим
@@ -85,12 +87,15 @@ class TranscriptionService:
                 # Настраиваем конфигурацию транскрибации
                 config = aai.TranscriptionConfig(
                     language_code=language_code,
-                    speaker_labels=True,  # Включаем диаризацию!
+                    speaker_labels=speaker_labels,
                     punctuate=True,  # Автоматическая пунктуация
                     format_text=True,  # Форматирование текста
                 )
                 
-                logger.info("🎙️ Начинаем транскрибацию с диаризацией...")
+                if speaker_labels:
+                    logger.info("🎙️ Начинаем транскрибацию с диаризацией...")
+                else:
+                    logger.info("🎙️ Начинаем транскрибацию без диаризации...")
                 
                 # Отправляем на транскрибацию (синхронно, т.к. SDK не поддерживает async)
                 transcript = self.transcriber.transcribe(temp_path, config)

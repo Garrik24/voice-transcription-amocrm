@@ -164,18 +164,35 @@ async def process_call(
         
         # 3. Транскрибируем
         logger.info("🎙️ Транскрибация...")
-        transcription = await transcription_service.transcribe_audio(audio_data)
-        
-        if not transcription.full_text or len(transcription.full_text) < 50:
-            logger.warning("⚠️ Транскрибация слишком короткая")
+        transcription = await transcription_service.transcribe_audio(audio_data, speaker_labels=True)
+
+        if not (transcription.full_text or "").strip():
+            logger.warning("⚠️ Пустая транскрибация (с диаризацией). Пробуем без диаризации...")
+            transcription = await transcription_service.transcribe_audio(audio_data, speaker_labels=False)
+
+        if len((transcription.full_text or "").strip()) < 50:
+            logger.warning(
+                f"⚠️ Транскрибация слишком короткая ({len((transcription.full_text or '').strip())} символов). "
+                "Пробуем без диаризации для улучшения..."
+            )
+            fallback = await transcription_service.transcribe_audio(audio_data, speaker_labels=False)
+            if len((fallback.full_text or "").strip()) > len((transcription.full_text or "").strip()):
+                transcription = fallback
+                logger.info("✅ Используем транскрипцию без диаризации (получилось длиннее)")
+
+        if not (transcription.full_text or "").strip():
+            logger.warning("⚠️ Транскрибация пустая даже после retry — пропускаем обработку")
             return
         
         # 4. Определяем роли
-        roles = transcription_service.identify_roles(transcription.speakers)
-        formatted_transcript = transcription_service.format_with_roles(
-            transcription.speakers, 
-            roles
-        )
+        if transcription.speakers:
+            roles = transcription_service.identify_roles(transcription.speakers)
+            formatted_transcript = transcription_service.format_with_roles(
+                transcription.speakers, 
+                roles
+            )
+        else:
+            formatted_transcript = transcription.full_text or ""
         logger.info(f"📝 Транскрибация: {len(formatted_transcript)} символов")
         
         # 5. Анализируем через GPT
@@ -502,18 +519,35 @@ async def process_uploaded_audio(
         # Используем общую логику обработки (без скачивания)
         # 1. Транскрибируем
         logger.info("🎙️ Транскрибация...")
-        transcription = await transcription_service.transcribe_audio(audio_data)
-        
-        if not transcription.full_text or len(transcription.full_text) < 50:
-            logger.warning("⚠️ Транскрибация слишком короткая")
+        transcription = await transcription_service.transcribe_audio(audio_data, speaker_labels=True)
+
+        if not (transcription.full_text or "").strip():
+            logger.warning("⚠️ Пустая транскрибация (с диаризацией). Пробуем без диаризации...")
+            transcription = await transcription_service.transcribe_audio(audio_data, speaker_labels=False)
+
+        if len((transcription.full_text or "").strip()) < 50:
+            logger.warning(
+                f"⚠️ Транскрибация слишком короткая ({len((transcription.full_text or '').strip())} символов). "
+                "Пробуем без диаризации для улучшения..."
+            )
+            fallback = await transcription_service.transcribe_audio(audio_data, speaker_labels=False)
+            if len((fallback.full_text or "").strip()) > len((transcription.full_text or "").strip()):
+                transcription = fallback
+                logger.info("✅ Используем транскрипцию без диаризации (получилось длиннее)")
+
+        if not (transcription.full_text or "").strip():
+            logger.warning("⚠️ Транскрибация пустая даже после retry — пропускаем обработку")
             return
         
         # 2. Определяем роли
-        roles = transcription_service.identify_roles(transcription.speakers)
-        formatted_transcript = transcription_service.format_with_roles(
-            transcription.speakers, 
-            roles
-        )
+        if transcription.speakers:
+            roles = transcription_service.identify_roles(transcription.speakers)
+            formatted_transcript = transcription_service.format_with_roles(
+                transcription.speakers, 
+                roles
+            )
+        else:
+            formatted_transcript = transcription.full_text or ""
         logger.info(f"📝 Транскрибация: {len(formatted_transcript)} символов")
         
         # 3. Анализируем через GPT
