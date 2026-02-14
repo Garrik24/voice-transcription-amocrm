@@ -60,6 +60,7 @@ voice-transcription/
 | `OPENAI_MODEL` | модель OpenAI (опционально, по умолчанию `gpt-4o-mini`) |
 | `GEMINI_API_KEY` | ключ из Google Gemini (нужен если `LLM_PROVIDER=gemini`) |
 | `GEMINI_MODEL` | модель Gemini (опционально, по умолчанию `gemini-2.0-flash-001`) |
+| `ANALYSIS_PIPELINE_VERSION` | `v1` или `v2` (по умолчанию `v1`, `v2` включает speaker stats + fact verifier) |
 | `TELEGRAM_BOT_TOKEN` | токен бота (опционально) |
 | `TELEGRAM_CHAT_ID` | ID чата (опционально) |
 | `APP_TIMEZONE` | таймзона для отображения времени (опционально, напр. `Europe/Moscow`) |

@@ -42,6 +42,11 @@ GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "3000"))
 # Температура для анализа (низкая = более точные факты)
 ANALYSIS_TEMPERATURE = float(os.getenv("ANALYSIS_TEMPERATURE", "0.1"))
 
+# Версия конвейера анализа:
+# v1 — текущий (агент анализа + валидатор пропущенных полей)
+# v2 — усиленный (speaker stats + fact verifier)
+ANALYSIS_PIPELINE_VERSION = os.getenv("ANALYSIS_PIPELINE_VERSION", "v1").strip().lower()
+
 # Максимальная длина транскрипции для анализа (символов)
 # Если транскрипция длиннее - берём начало и конец (где обычно ключевая информация)
 MAX_TRANSCRIPT_LENGTH = int(os.getenv("MAX_TRANSCRIPT_LENGTH", "15000"))

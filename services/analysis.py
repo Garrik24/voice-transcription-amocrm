@@ -6,7 +6,7 @@ import openai
 import json
 import logging
 import re
-from typing import List
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 from config import (
     GEMINI_API_KEY,
@@ -17,6 +17,7 @@ from config import (
     OPENAI_MAX_TOKENS,
     GEMINI_MAX_OUTPUT_TOKENS,
     ANALYSIS_TEMPERATURE,
+    ANALYSIS_PIPELINE_VERSION,
     MAX_TRANSCRIPT_LENGTH,
     TRUNCATE_TRANSCRIPT_FOR_ANALYSIS,
 )
@@ -102,6 +103,36 @@ class CallAnalysis:
     call_result: str  # Итог звонка
     next_contact_date: str  # Когда связаться
     next_steps: List[str]  # Следующие шаги для менеджера (0-5)
+    speaker_stats: Optional["SpeakerStats"] = None  # Метрики по участникам (v2)
+
+
+@dataclass
+class SpeakerMetrics:
+    """Метрики по отдельному спикеру."""
+    label: str
+    duration_seconds: float
+    share_percent: float
+
+
+@dataclass
+class SpeakerStats:
+    """Агрегированные метрики диаризации."""
+    participant_count: int
+    total_speech_seconds: float
+    dominant_speaker: str
+    suspicious_diarization: bool
+    suspicious_reason: str
+    speakers: List[SpeakerMetrics]
+
+
+@dataclass
+class FieldVerification:
+    """Результат верификации одного поля."""
+    field: str
+    status: str  # supported | unsure | contradicted
+    confidence: float
+    suggested_fix: Any
+    evidence: List[str]
 
 
 # Системный промпт для анализа (Агент 1)
@@ -232,9 +263,348 @@ VALIDATOR_USER_PROMPT = """Первый анализ пропустил обяз
 """
 
 
+VERIFY_FIELDS = [
+    "client_name",
+    "manager_name",
+    "client_city",
+    "work_type",
+    "cost",
+    "payment_terms",
+    "call_result",
+    "next_contact_date",
+    "next_steps",
+]
+
+FIELD_DEFAULTS: Dict[str, Any] = {
+    "client_name": "Клиент",
+    "manager_name": "Менеджер",
+    "client_city": "Не указано",
+    "work_type": "Консультация",
+    "cost": "Не обсуждали",
+    "payment_terms": "Не обсуждали",
+    "call_result": "Не определено",
+    "next_contact_date": "Не указано",
+    "next_steps": [],
+}
+
+FACT_VERIFIER_SYSTEM_PROMPT = """Ты — аудитор фактов по транскрибации звонка.
+
+Твоя задача:
+1) Проверить каждое поле анализа.
+2) Для каждого поля вернуть status/confidence/suggested_fix/evidence.
+
+Правила:
+- status:
+  - supported: значение подтверждается транскрибацией,
+  - unsure: подтверждение слабое или неоднозначное,
+  - contradicted: значение противоречит транскрибации.
+- confidence: число от 0 до 1.
+- suggested_fix: безопасная замена, если поле не подтверждено.
+- evidence: 1-3 коротких точных фрагмента из транскрибации (только текст, без комментариев).
+- Не выдумывай. Если данных нет, предложи безопасное значение.
+
+Безопасные значения:
+- city/date -> "Не указано"
+- cost/payment_terms -> "Не обсуждали"
+- work_type -> "Консультация"
+- call_result -> "Не определено"
+- next_steps -> []
+
+Ответ строго JSON."""
+
+
+FACT_VERIFIER_USER_PROMPT = """Проверь анализ на соответствие транскрибации.
+
+Черновой анализ (JSON):
+{analysis_json}
+
+Метрики спикеров (JSON):
+{speaker_stats_json}
+
+Транскрибация:
+{transcript}
+
+Верни JSON формата:
+{{
+  "fields": {{
+    "client_name": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":"Клиент","evidence":["..."]}},
+    "manager_name": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":"Менеджер","evidence":["..."]}},
+    "client_city": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":"Не указано","evidence":["..."]}},
+    "work_type": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":"Консультация","evidence":["..."]}},
+    "cost": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":"Не обсуждали","evidence":["..."]}},
+    "payment_terms": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":"Не обсуждали","evidence":["..."]}},
+    "call_result": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":"Не определено","evidence":["..."]}},
+    "next_contact_date": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":"Не указано","evidence":["..."]}},
+    "next_steps": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":[],"evidence":["..."]}}
+  }}
+}}
+"""
+
+
 class AnalysisService:
     """Сервис анализа разговоров через GPT/Gemini с валидацией"""
-    
+
+    @staticmethod
+    def _clamp_confidence(value: Any) -> float:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(1.0, v))
+
+    @staticmethod
+    def _to_short_evidence_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            raw = value
+        elif isinstance(value, str):
+            raw = [value]
+        else:
+            raw = []
+
+        normalized: List[str] = []
+        for item in raw:
+            text = str(item).strip()
+            if not text:
+                continue
+            normalized.append(text[:240])
+            if len(normalized) == 3:
+                break
+        return normalized
+
+    def _analysis_to_dict(self, analysis: CallAnalysis) -> Dict[str, Any]:
+        return {
+            "client_name": analysis.client_name,
+            "manager_name": analysis.manager_name,
+            "summary": analysis.summary,
+            "client_city": analysis.client_city,
+            "work_type": analysis.work_type,
+            "cost": analysis.cost,
+            "payment_terms": analysis.payment_terms,
+            "call_result": analysis.call_result,
+            "next_contact_date": analysis.next_contact_date,
+            "next_steps": analysis.next_steps,
+        }
+
+    def _build_speaker_stats(self, speakers: Optional[List[Any]]) -> SpeakerStats:
+        if not speakers:
+            return SpeakerStats(
+                participant_count=0,
+                total_speech_seconds=0.0,
+                dominant_speaker="-",
+                suspicious_diarization=True,
+                suspicious_reason="no_speakers",
+                speakers=[],
+            )
+
+        durations_ms: Dict[str, int] = {}
+        for item in speakers:
+            label = str(getattr(item, "label", getattr(item, "speaker", "?")))
+            start_ms = int(getattr(item, "start_ms", 0) or 0)
+            end_ms = int(getattr(item, "end_ms", 0) or 0)
+            duration_ms = max(0, end_ms - start_ms)
+            if duration_ms <= 0:
+                continue
+            durations_ms[label] = durations_ms.get(label, 0) + duration_ms
+
+        if not durations_ms:
+            return SpeakerStats(
+                participant_count=0,
+                total_speech_seconds=0.0,
+                dominant_speaker="-",
+                suspicious_diarization=True,
+                suspicious_reason="no_positive_durations",
+                speakers=[],
+            )
+
+        total_ms = sum(durations_ms.values())
+        metrics: List[SpeakerMetrics] = []
+        for label, duration_ms in sorted(durations_ms.items(), key=lambda pair: pair[1], reverse=True):
+            share_percent = (duration_ms / total_ms) * 100 if total_ms > 0 else 0.0
+            metrics.append(
+                SpeakerMetrics(
+                    label=label,
+                    duration_seconds=round(duration_ms / 1000, 1),
+                    share_percent=round(share_percent, 1),
+                )
+            )
+
+        participant_count = len(metrics)
+        suspicious_reasons: List[str] = []
+        if participant_count <= 1 and total_ms >= 45_000:
+            suspicious_reasons.append("single_speaker_long_call")
+        if participant_count >= 6 and total_ms <= 600_000:
+            suspicious_reasons.append("too_many_speakers_for_short_call")
+
+        return SpeakerStats(
+            participant_count=participant_count,
+            total_speech_seconds=round(total_ms / 1000, 1),
+            dominant_speaker=metrics[0].label,
+            suspicious_diarization=bool(suspicious_reasons),
+            suspicious_reason=";".join(suspicious_reasons),
+            speakers=metrics,
+        )
+
+    def _normalize_verification_result(self, payload: Dict[str, Any]) -> Dict[str, FieldVerification]:
+        fields_payload = payload.get("fields", payload)
+        result: Dict[str, FieldVerification] = {}
+        for field in VERIFY_FIELDS:
+            raw = fields_payload.get(field, {}) if isinstance(fields_payload, dict) else {}
+            status = str(raw.get("status", "unsure")).strip().lower()
+            if status not in {"supported", "unsure", "contradicted"}:
+                status = "unsure"
+            suggested_fix = raw.get("suggested_fix", FIELD_DEFAULTS[field])
+            result[field] = FieldVerification(
+                field=field,
+                status=status,
+                confidence=self._clamp_confidence(raw.get("confidence", 0.0)),
+                suggested_fix=suggested_fix,
+                evidence=self._to_short_evidence_list(raw.get("evidence", [])),
+            )
+        return result
+
+    async def _verify_with_gemini(
+        self,
+        analysis: CallAnalysis,
+        transcript: str,
+        speaker_stats: SpeakerStats,
+    ) -> Dict[str, FieldVerification]:
+        try:
+            prepared_transcript = self._prepare_transcript(transcript)
+            gemini = _get_gemini_client()
+            from google.genai import types
+
+            schema = {
+                "type": "OBJECT",
+                "required": ["fields"],
+                "properties": {
+                    "fields": {
+                        "type": "OBJECT",
+                        "properties": {
+                            name: {
+                                "type": "OBJECT",
+                                "required": ["status", "confidence", "suggested_fix", "evidence"],
+                                "properties": {
+                                    "status": {"type": "STRING"},
+                                    "confidence": {"type": "NUMBER"},
+                                    "suggested_fix": {"type": "STRING"} if name != "next_steps" else {"type": "ARRAY", "items": {"type": "STRING"}},
+                                    "evidence": {"type": "ARRAY", "items": {"type": "STRING"}},
+                                },
+                            }
+                            for name in VERIFY_FIELDS
+                        },
+                    }
+                },
+            }
+
+            prompt = FACT_VERIFIER_USER_PROMPT.format(
+                analysis_json=json.dumps(self._analysis_to_dict(analysis), ensure_ascii=False),
+                speaker_stats_json=json.dumps(
+                    {
+                        "participant_count": speaker_stats.participant_count,
+                        "total_speech_seconds": speaker_stats.total_speech_seconds,
+                        "dominant_speaker": speaker_stats.dominant_speaker,
+                        "suspicious_diarization": speaker_stats.suspicious_diarization,
+                    },
+                    ensure_ascii=False,
+                ),
+                transcript=prepared_transcript,
+            )
+
+            response = await gemini.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=f"{FACT_VERIFIER_SYSTEM_PROMPT}\n\n{prompt}",
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=1200,
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                ),
+            )
+            parsed = json.loads(response.text or "{}")
+            return self._normalize_verification_result(parsed)
+        except Exception as e:
+            logger.error(f"Ошибка fact verifier через Gemini: {e}")
+            return {
+                field: FieldVerification(
+                    field=field,
+                    status="unsure",
+                    confidence=0.0,
+                    suggested_fix=FIELD_DEFAULTS[field],
+                    evidence=[],
+                )
+                for field in VERIFY_FIELDS
+            }
+
+    async def _verify_with_openai(
+        self,
+        analysis: CallAnalysis,
+        transcript: str,
+        speaker_stats: SpeakerStats,
+    ) -> Dict[str, FieldVerification]:
+        try:
+            prepared_transcript = self._prepare_transcript(transcript)
+            client = _get_client()
+            response = await client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": FACT_VERIFIER_SYSTEM_PROMPT},
+                    {"role": "user", "content": FACT_VERIFIER_USER_PROMPT.format(
+                        analysis_json=json.dumps(self._analysis_to_dict(analysis), ensure_ascii=False),
+                        speaker_stats_json=json.dumps(
+                            {
+                                "participant_count": speaker_stats.participant_count,
+                                "total_speech_seconds": speaker_stats.total_speech_seconds,
+                                "dominant_speaker": speaker_stats.dominant_speaker,
+                                "suspicious_diarization": speaker_stats.suspicious_diarization,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        transcript=prepared_transcript,
+                    )},
+                ],
+                temperature=0.0,
+                max_tokens=1200,
+                response_format={"type": "json_object"},
+            )
+            parsed = json.loads(response.choices[0].message.content or "{}")
+            return self._normalize_verification_result(parsed)
+        except Exception as e:
+            logger.error(f"Ошибка fact verifier через OpenAI: {e}")
+            return {
+                field: FieldVerification(
+                    field=field,
+                    status="unsure",
+                    confidence=0.0,
+                    suggested_fix=FIELD_DEFAULTS[field],
+                    evidence=[],
+                )
+                for field in VERIFY_FIELDS
+            }
+
+    def _apply_verification(self, analysis: CallAnalysis, checks: Dict[str, FieldVerification]) -> CallAnalysis:
+        for field, check in checks.items():
+            logger.info(
+                "v2 verify field=%s status=%s confidence=%.2f suggested_fix=%s evidence=%s",
+                field,
+                check.status,
+                check.confidence,
+                check.suggested_fix,
+                check.evidence,
+            )
+            if check.status == "supported":
+                continue
+
+            fallback = check.suggested_fix if check.suggested_fix not in (None, "") else FIELD_DEFAULTS[field]
+            if field == "next_steps":
+                if isinstance(fallback, list):
+                    analysis.next_steps = [str(x).strip() for x in fallback if str(x).strip()][:5]
+                else:
+                    analysis.next_steps = _normalize_list_field(fallback)
+                continue
+
+            setattr(analysis, field, str(fallback))
+        return analysis
+
     async def _validate_with_gemini(
         self,
         transcript: str,
@@ -406,7 +776,8 @@ class AnalysisService:
         self, 
         transcript: str,
         call_type: str = "outgoing",
-        manager_name: str = "Менеджер"
+        manager_name: str = "Менеджер",
+        speakers: Optional[List[Any]] = None,
     ) -> CallAnalysis:
         """
         Анализирует транскрибацию звонка и извлекает структурированные данные.
@@ -579,8 +950,33 @@ class AnalysisService:
                 transcript,  # Используем оригинальную транскрипцию
                 manager_name
             )
-            
+
             logger.info("✅ Агент 2 (валидация) завершил работу")
+
+            # v2: детерминированные метрики спикеров + верификация фактов.
+            speaker_stats = self._build_speaker_stats(speakers)
+            validated_analysis.speaker_stats = speaker_stats
+            logger.info(
+                "v2 speaker stats: participants=%s total_speech_seconds=%.1f dominant=%s suspicious=%s reason=%s",
+                speaker_stats.participant_count,
+                speaker_stats.total_speech_seconds,
+                speaker_stats.dominant_speaker,
+                speaker_stats.suspicious_diarization,
+                speaker_stats.suspicious_reason,
+            )
+
+            if ANALYSIS_PIPELINE_VERSION == "v2":
+                logger.info("🚀 ANALYSIS_PIPELINE_VERSION=v2, запускаем fact verifier (Агент 3)")
+                provider = (LLM_PROVIDER or "openai").strip().lower()
+                if provider == "gemini":
+                    checks = await self._verify_with_gemini(validated_analysis, transcript, speaker_stats)
+                else:
+                    checks = await self._verify_with_openai(validated_analysis, transcript, speaker_stats)
+                validated_analysis = self._apply_verification(validated_analysis, checks)
+                logger.info("✅ Агент 3 (fact verifier) завершил работу")
+            else:
+                logger.info("ℹ️ ANALYSIS_PIPELINE_VERSION=v1, fact verifier отключен")
+
             return validated_analysis
             
         except json.JSONDecodeError as e:
@@ -608,10 +1004,15 @@ class AnalysisService:
         steps_block = ""
         if analysis.next_steps:
             steps_block = "\n\n✅ Следующие шаги:\n" + "\n".join([f"- {s}" for s in analysis.next_steps])
+
+        participants_block = ""
+        if analysis.speaker_stats and analysis.speaker_stats.participant_count > 0:
+            participants_block = f"\n👥 Участники: {analysis.speaker_stats.participant_count}"
         
         note = f"""🎙️ АНАЛИЗ ЗВОНКА (AI)
 
 📞 {call_type_str} | {duration_str}
+{participants_block}
 
 Спикеры:
 - {analysis.manager_name} (менеджер)

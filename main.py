@@ -206,7 +206,8 @@ async def process_call(
         analysis = await analysis_service.analyze_call(
             formatted_transcript,
             call_type=call_type_simple,
-            manager_name=manager_name
+            manager_name=manager_name,
+            speakers=transcription.speakers,
         )
         
         # 6. Формируем примечание
@@ -561,7 +562,8 @@ async def process_uploaded_audio(
         analysis = await analysis_service.analyze_call(
             formatted_transcript,
             call_type=call_type_simple,
-            manager_name=manager_name
+            manager_name=manager_name,
+            speakers=transcription.speakers,
         )
         
         # 4. Формируем примечание
