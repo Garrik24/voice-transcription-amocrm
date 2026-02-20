@@ -63,15 +63,22 @@ class TranscriptionService:
             f"AssemblyAI config: models={speech_models}, "
             f"speakers_expected={ASSEMBLYAI_SPEAKERS_EXPECTED}, "
             f"multichannel={ASSEMBLYAI_MULTICHANNEL}, "
-            f"speaker_labels={speaker_labels}"
+            f"speaker_labels={speaker_labels}, "
+            f"language_detection={'universal-3' in ASSEMBLYAI_SPEECH_MODEL}"
         )
+
+        use_lang_detection = "universal-3" in ASSEMBLYAI_SPEECH_MODEL
 
         kwargs: dict = {
             "speech_models": speech_models,
-            "language_code": language_code,
             "punctuate": True,
             "format_text": True,
         }
+
+        if use_lang_detection:
+            kwargs["language_detection"] = True
+        else:
+            kwargs["language_code"] = language_code
 
         if ASSEMBLYAI_MULTICHANNEL:
             kwargs["multichannel"] = True
