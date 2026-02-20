@@ -7,7 +7,7 @@ python-multipart==0.0.6
 httpx>=0.28.1,<1
 
 # AI Services
-assemblyai==0.23.1
+assemblyai>=0.52.0,<1
 openai>=1.40.0,<2
 google-genai==1.33.0
 
