@@ -15,6 +15,10 @@ AMOCRM_REFRESH_TOKEN = os.getenv("AMOCRM_REFRESH_TOKEN")
 AMOCRM_CLIENT_ID = os.getenv("AMOCRM_CLIENT_ID")
 AMOCRM_CLIENT_SECRET = os.getenv("AMOCRM_CLIENT_SECRET")
 
+# ============== STT Provider ==============
+# assemblyai | yandex
+STT_PROVIDER = os.getenv("STT_PROVIDER", "assemblyai").strip().lower()
+
 # ============== AssemblyAI ==============
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 
@@ -64,6 +68,10 @@ MAX_TRANSCRIPT_LENGTH = int(os.getenv("MAX_TRANSCRIPT_LENGTH", "15000"))
 # Обрезать транскрипцию для анализа (экономия токенов).
 # По умолчанию ВЫКЛЮЧЕНО: для звонков до ~30 минут хотим анализировать весь текст без потерь.
 TRUNCATE_TRANSCRIPT_FOR_ANALYSIS = os.getenv("TRUNCATE_TRANSCRIPT_FOR_ANALYSIS", "false").strip().lower() == "true"
+
+# ============== Yandex SpeechKit ==============
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY")
+YANDEX_STT_LANGUAGE = os.getenv("YANDEX_STT_LANGUAGE", "ru-RU")
 
 # ============== Telegram ==============
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")

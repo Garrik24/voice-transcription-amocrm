@@ -1,18 +1,29 @@
 """
-Сервис транскрибации через AssemblyAI.
-Поддерживает диаризацию (разделение по говорящим) и Speaker Identification по ролям.
+Сервис транскрибации.
+Поддерживает два провайдера (STT_PROVIDER):
+  - assemblyai (по умолчанию): AssemblyAI SDK с диаризацией
+  - yandex: Yandex SpeechKit Async REST API с поканальной диаризацией
 """
-import assemblyai as aai
+import asyncio
+import base64
+import httpx
 import logging
-import tempfile
 import os
-from typing import Optional, List, Dict
+import tempfile
+import time
 from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+import assemblyai as aai
+
 from config import (
     ASSEMBLYAI_API_KEY,
-    ASSEMBLYAI_SPEECH_MODEL,
-    ASSEMBLYAI_SPEAKERS_EXPECTED,
     ASSEMBLYAI_MULTICHANNEL,
+    ASSEMBLYAI_SPEAKERS_EXPECTED,
+    ASSEMBLYAI_SPEECH_MODEL,
+    STT_PROVIDER,
+    YANDEX_API_KEY,
+    YANDEX_STT_LANGUAGE,
 )
 
 logger = logging.getLogger(__name__)
@@ -20,6 +31,10 @@ logger = logging.getLogger(__name__)
 aai.settings.api_key = ASSEMBLYAI_API_KEY
 
 KNOWN_ROLES = {"Менеджер", "Клиент"}
+
+# Yandex SpeechKit endpoints
+_YANDEX_TRANSCRIBE_URL = "https://transcribe.api.cloud.yandex.net/speech/stt/v2/longRunningRecognize"
+_YANDEX_OPERATION_URL = "https://operation.api.cloud.yandex.net/operations/{}"
 
 
 @dataclass
@@ -44,12 +59,323 @@ class TranscriptionResult:
 
 
 class TranscriptionService:
-    """Сервис транскрибации с диаризацией"""
+    """Сервис транскрибации с диаризацией. Провайдер выбирается через STT_PROVIDER."""
 
     def __init__(self):
         self.transcriber = aai.Transcriber()
 
-    def _build_config(
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+
+    async def transcribe_audio(
+        self,
+        audio_data: bytes,
+        language_code: str = "ru",
+        speaker_labels: bool = True,
+    ) -> TranscriptionResult:
+        """
+        Транскрибирует аудио. Провайдер выбирается через STT_PROVIDER.
+
+        Args:
+            audio_data: Бинарные данные аудиофайла
+            language_code: Код языка (ru, en, etc.)
+            speaker_labels: Включить диаризацию (speaker labels)
+
+        Returns:
+            TranscriptionResult с разделением по говорящим
+        """
+        provider = STT_PROVIDER
+        logger.info(f"🎙️ STT провайдер: {provider}")
+
+        if provider == "yandex":
+            return await self._transcribe_yandex(audio_data, speaker_labels)
+        else:
+            return await self._transcribe_assemblyai(audio_data, language_code, speaker_labels)
+
+    def identify_roles(self, speakers: List[Speaker]) -> Dict[str, str]:
+        """
+        Определяет роли (менеджер/клиент).
+
+        Приоритет 1: Если провайдер уже вернул роли (label == "Менеджер" или "Клиент").
+        Приоритет 2: Эвристика по ключевым словам (fallback).
+        """
+        if not speakers:
+            return {}
+
+        unique_labels = {s.label for s in speakers}
+
+        if unique_labels & KNOWN_ROLES:
+            logger.info("identify_roles: используем роли от провайдера")
+            roles = {}
+            for label in unique_labels:
+                if label in KNOWN_ROLES:
+                    roles[label] = label
+                else:
+                    roles[label] = f"Говорящий {label}"
+            return roles
+
+        logger.info("identify_roles: fallback на эвристику по ключевым словам")
+        return self._identify_roles_heuristic(speakers)
+
+    def format_with_roles(
+        self,
+        speakers: List[Speaker],
+        roles: Dict[str, str],
+    ) -> str:
+        """Форматирует текст с ролями вместо Speaker A/B."""
+        lines = []
+        for speaker in speakers:
+            role = roles.get(speaker.label, f"Говорящий {speaker.label}")
+            lines.append(f"[{role}]: {speaker.text}")
+        return "\n".join(lines)
+
+    # -------------------------------------------------------------------------
+    # Yandex SpeechKit
+    # -------------------------------------------------------------------------
+
+    async def _transcribe_yandex(
+        self,
+        audio_data: bytes,
+        speaker_labels: bool,
+    ) -> TranscriptionResult:
+        """
+        Транскрибация через Yandex SpeechKit Async API.
+        Использует поканальную диаризацию (channelTag) для разделения менеджера и клиента.
+        """
+        if not YANDEX_API_KEY:
+            raise ValueError("YANDEX_API_KEY не задан. Добавьте его в Railway Variables.")
+
+        logger.info(f"📁 Размер аудио: {len(audio_data)} байт")
+
+        audio_b64 = base64.b64encode(audio_data).decode("utf-8")
+
+        # Определяем формат
+        audio_encoding = "MP3"
+        if audio_data[:4] == b'RIFF':
+            audio_encoding = "LINEAR16_PCM"
+        elif audio_data[:4] == b'OggS':
+            audio_encoding = "OGG_OPUS"
+
+        logger.info(f"📁 Формат для Yandex: {audio_encoding}")
+
+        body = {
+            "config": {
+                "specification": {
+                    "languageCode": YANDEX_STT_LANGUAGE,
+                    "audioEncoding": audio_encoding,
+                    "model": "general",
+                    "profanityFilter": False,
+                    "literature_text": False,
+                    "audioChannelCount": 2,
+                    "rawResults": False,
+                }
+            },
+            "audio": {
+                "content": audio_b64,
+            },
+        }
+
+        headers = {
+            "Authorization": f"Api-Key {YANDEX_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        logger.info("🎙️ Отправляем запрос в Yandex SpeechKit...")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(_YANDEX_TRANSCRIBE_URL, json=body, headers=headers)
+            if resp.status_code != 200:
+                raise Exception(f"Yandex SpeechKit ошибка запуска: {resp.status_code} — {resp.text[:300]}")
+
+            operation_id = resp.json().get("id")
+            if not operation_id:
+                raise Exception(f"Yandex SpeechKit не вернул operation id: {resp.text[:300]}")
+
+            logger.info(f"⏳ Yandex operation: {operation_id}")
+
+            # Polling до завершения (макс. 5 минут)
+            op_url = _YANDEX_OPERATION_URL.format(operation_id)
+            for attempt in range(60):
+                await asyncio.sleep(5)
+                op_resp = await client.get(op_url, headers=headers)
+                op_data = op_resp.json()
+
+                if op_data.get("done"):
+                    logger.info(f"✅ Yandex операция завершена (попытка {attempt + 1})")
+                    break
+            else:
+                raise Exception("Yandex SpeechKit: превышено время ожидания (5 минут)")
+
+            if "error" in op_data:
+                raise Exception(f"Yandex SpeechKit ошибка: {op_data['error']}")
+
+            return self._parse_yandex_response(op_data)
+
+    def _parse_yandex_response(self, op_data: dict) -> TranscriptionResult:
+        """Парсит ответ Yandex SpeechKit в TranscriptionResult."""
+        response = op_data.get("response", {})
+        chunks = response.get("chunks", [])
+
+        speakers: List[Speaker] = []
+        all_words = []
+        duration_ms = 0
+
+        for chunk in chunks:
+            channel_tag = str(chunk.get("channelTag", "1"))
+            # channelTag "1" → менеджер (исходящий звонок), "2" → клиент
+            role = "Менеджер" if channel_tag == "1" else "Клиент"
+
+            alternatives = chunk.get("alternatives", [])
+            if not alternatives:
+                continue
+
+            best = alternatives[0]
+            text = best.get("text", "").strip()
+            if not text:
+                continue
+
+            words = best.get("words", [])
+            start_ms = 0
+            end_ms = 0
+            if words:
+                try:
+                    start_ms = int(float(words[0].get("startTime", "0s").rstrip("s")) * 1000)
+                    end_ms = int(float(words[-1].get("endTime", "0s").rstrip("s")) * 1000)
+                except (ValueError, AttributeError):
+                    pass
+
+            duration_ms = max(duration_ms, end_ms)
+            all_words.append(text)
+
+            speakers.append(Speaker(
+                label=role,
+                text=text,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            ))
+
+        # Сортируем по времени начала реплики
+        speakers.sort(key=lambda s: s.start_ms)
+
+        full_text = " ".join(all_words)
+        formatted_text = "\n".join(f"[{s.label}]: {s.text}" for s in speakers)
+        duration_seconds = duration_ms / 1000.0
+
+        logger.info(
+            f"Транскрибация завершена (Yandex): {len(full_text)} символов, "
+            f"{len(speakers)} фрагментов, {duration_seconds:.1f} сек, roles_from_ai=True"
+        )
+
+        return TranscriptionResult(
+            full_text=full_text,
+            speakers=speakers,
+            formatted_text=formatted_text,
+            duration_seconds=duration_seconds,
+            confidence=1.0,
+            language=YANDEX_STT_LANGUAGE,
+            roles_from_ai=True,
+        )
+
+    # -------------------------------------------------------------------------
+    # AssemblyAI (fallback / default)
+    # -------------------------------------------------------------------------
+
+    async def _transcribe_assemblyai(
+        self,
+        audio_data: bytes,
+        language_code: str,
+        speaker_labels: bool,
+    ) -> TranscriptionResult:
+        """Транскрибация через AssemblyAI (оригинальный код)."""
+        logger.info(f"📁 Размер аудио: {len(audio_data)} байт")
+
+        suffix = ".mp3"
+        if audio_data[:4] == b'RIFF':
+            suffix = ".wav"
+        elif audio_data[:3] == b'ID3' or audio_data[:2] == b'\xff\xfb':
+            suffix = ".mp3"
+        elif audio_data[:4] == b'OggS':
+            suffix = ".ogg"
+        elif audio_data[:4] == b'fLaC':
+            suffix = ".flac"
+
+        logger.info(f"📁 Определён формат: {suffix}")
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(audio_data)
+            temp_path = f.name
+
+        logger.info(f"📁 Временный файл: {temp_path}")
+
+        try:
+            config = self._build_assemblyai_config(language_code, speaker_labels)
+
+            if speaker_labels:
+                logger.info("🎙️ Начинаем транскрибацию с диаризацией (Universal-3-Pro + Speaker ID)...")
+            else:
+                logger.info("🎙️ Начинаем транскрибацию без диаризации...")
+
+            transcript = self.transcriber.transcribe(temp_path, config)
+
+            logger.info(f"📝 Статус транскрибации: {transcript.status}")
+
+            if transcript.status == aai.TranscriptStatus.error:
+                raise Exception(f"Ошибка транскрибации: {transcript.error}")
+
+            speakers = []
+            formatted_lines = []
+            roles_from_ai = False
+
+            if transcript.utterances:
+                roles_from_ai = self._has_ai_roles(transcript.utterances)
+                if roles_from_ai:
+                    logger.info("✅ AssemblyAI вернул именованные роли (Speaker Identification)")
+                else:
+                    unique_labels = {u.speaker for u in transcript.utterances}
+                    logger.info(f"ℹ️ AssemblyAI вернул буквенные метки: {unique_labels}")
+
+                for utterance in transcript.utterances:
+                    speaker = Speaker(
+                        label=utterance.speaker,
+                        text=utterance.text,
+                        start_ms=utterance.start,
+                        end_ms=utterance.end,
+                    )
+                    speakers.append(speaker)
+                    formatted_lines.append(f"[{utterance.speaker}]: {utterance.text}")
+            else:
+                formatted_lines.append(transcript.text or "")
+
+            duration_seconds = 0.0
+            if transcript.audio_duration:
+                duration_seconds = transcript.audio_duration
+            elif speakers:
+                duration_seconds = speakers[-1].end_ms / 1000
+
+            result = TranscriptionResult(
+                full_text=transcript.text or "",
+                speakers=speakers,
+                formatted_text="\n".join(formatted_lines),
+                duration_seconds=duration_seconds,
+                confidence=transcript.confidence or 0.0,
+                language=language_code,
+                roles_from_ai=roles_from_ai,
+            )
+
+            logger.info(
+                f"Транскрибация завершена: {len(result.full_text)} символов, "
+                f"{len(speakers)} фрагментов, {duration_seconds:.1f} сек, "
+                f"roles_from_ai={roles_from_ai}"
+            )
+
+            return result
+
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def _build_assemblyai_config(
         self,
         language_code: str,
         speaker_labels: bool,
@@ -96,141 +422,6 @@ class TranscriptionService:
         labels = {u.speaker for u in utterances}
         return bool(labels & KNOWN_ROLES)
 
-    async def transcribe_audio(
-        self,
-        audio_data: bytes,
-        language_code: str = "ru",
-        speaker_labels: bool = True,
-    ) -> TranscriptionResult:
-        """
-        Транскрибирует аудио (опционально с диаризацией).
-
-        Args:
-            audio_data: Бинарные данные аудиофайла
-            language_code: Код языка (ru, en, etc.)
-            speaker_labels: Включить диаризацию (speaker labels)
-
-        Returns:
-            Результат транскрибации с разделением по говорящим
-        """
-        try:
-            logger.info(f"📁 Размер аудио: {len(audio_data)} байт")
-
-            suffix = ".mp3"
-            if audio_data[:4] == b'RIFF':
-                suffix = ".wav"
-            elif audio_data[:3] == b'ID3' or audio_data[:2] == b'\xff\xfb':
-                suffix = ".mp3"
-            elif audio_data[:4] == b'OggS':
-                suffix = ".ogg"
-            elif audio_data[:4] == b'fLaC':
-                suffix = ".flac"
-
-            logger.info(f"📁 Определён формат: {suffix}")
-
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-                f.write(audio_data)
-                temp_path = f.name
-
-            logger.info(f"📁 Временный файл: {temp_path}")
-
-            try:
-                config = self._build_config(language_code, speaker_labels)
-
-                if speaker_labels:
-                    logger.info("🎙️ Начинаем транскрибацию с диаризацией (Universal-3-Pro + Speaker ID)...")
-                else:
-                    logger.info("🎙️ Начинаем транскрибацию без диаризации...")
-
-                transcript = self.transcriber.transcribe(temp_path, config)
-
-                logger.info(f"📝 Статус транскрибации: {transcript.status}")
-
-                if transcript.status == aai.TranscriptStatus.error:
-                    raise Exception(f"Ошибка транскрибации: {transcript.error}")
-
-                speakers = []
-                formatted_lines = []
-                roles_from_ai = False
-
-                if transcript.utterances:
-                    roles_from_ai = self._has_ai_roles(transcript.utterances)
-                    if roles_from_ai:
-                        logger.info("✅ AssemblyAI вернул именованные роли (Speaker Identification)")
-                    else:
-                        unique_labels = {u.speaker for u in transcript.utterances}
-                        logger.info(f"ℹ️ AssemblyAI вернул буквенные метки: {unique_labels}")
-
-                    for utterance in transcript.utterances:
-                        speaker = Speaker(
-                            label=utterance.speaker,
-                            text=utterance.text,
-                            start_ms=utterance.start,
-                            end_ms=utterance.end,
-                        )
-                        speakers.append(speaker)
-                        formatted_lines.append(f"[{utterance.speaker}]: {utterance.text}")
-                else:
-                    formatted_lines.append(transcript.text or "")
-
-                duration_seconds = 0
-                if transcript.audio_duration:
-                    duration_seconds = transcript.audio_duration
-                elif speakers:
-                    duration_seconds = speakers[-1].end_ms / 1000
-
-                result = TranscriptionResult(
-                    full_text=transcript.text or "",
-                    speakers=speakers,
-                    formatted_text="\n".join(formatted_lines),
-                    duration_seconds=duration_seconds,
-                    confidence=transcript.confidence or 0.0,
-                    language=language_code,
-                    roles_from_ai=roles_from_ai,
-                )
-
-                logger.info(
-                    f"Транскрибация завершена: {len(result.full_text)} символов, "
-                    f"{len(speakers)} фрагментов, {duration_seconds:.1f} сек, "
-                    f"roles_from_ai={roles_from_ai}"
-                )
-
-                return result
-
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-
-        except Exception as e:
-            logger.error(f"Ошибка транскрибации: {e}")
-            raise
-
-    def identify_roles(self, speakers: List[Speaker]) -> Dict[str, str]:
-        """
-        Определяет роли (менеджер/клиент).
-
-        Приоритет 1: Если AssemblyAI Speaker Identification уже вернул роли
-        (label == "Менеджер" или "Клиент"), используем их напрямую.
-        Приоритет 2: Эвристика по ключевым словам (fallback).
-        """
-        if not speakers:
-            return {}
-
-        unique_labels = {s.label for s in speakers}
-
-        if unique_labels & KNOWN_ROLES:
-            logger.info("identify_roles: используем роли от AssemblyAI Speaker ID")
-            roles = {}
-            for label in unique_labels:
-                if label in KNOWN_ROLES:
-                    roles[label] = label
-                else:
-                    roles[label] = f"Говорящий {label}"
-            return roles
-
-        logger.info("identify_roles: fallback на эвристику по ключевым словам")
-        return self._identify_roles_heuristic(speakers)
-
     def _identify_roles_heuristic(self, speakers: List[Speaker]) -> Dict[str, str]:
         """Эвристика определения ролей по ключевым словам."""
         roles = {}
@@ -254,7 +445,6 @@ class TranscriptionService:
 
         for label, texts in speaker_texts.items():
             full_text = " ".join(texts)
-
             manager_score = sum(1 for ind in manager_indicators if ind in full_text)
             client_score = sum(1 for ind in client_indicators if ind in full_text)
 
@@ -269,21 +459,6 @@ class TranscriptionService:
             roles[labels[1]] = "Клиент"
 
         return roles
-
-    def format_with_roles(
-        self,
-        speakers: List[Speaker],
-        roles: Dict[str, str],
-    ) -> str:
-        """
-        Форматирует текст с ролями вместо Speaker A/B.
-        """
-        lines = []
-        for speaker in speakers:
-            role = roles.get(speaker.label, f"Говорящий {speaker.label}")
-            lines.append(f"[{role}]: {speaker.text}")
-
-        return "\n".join(lines)
 
 
 transcription_service = TranscriptionService()
