@@ -11,9 +11,8 @@ AMOCRM_ACCESS_TOKEN=your_amocrm_access_token_here
 
 # AssemblyAI (для транскрибации с диаризацией)
 ASSEMBLYAI_API_KEY=your_assemblyai_api_key_here
-# Модель распознавания (universal-3-pro | universal-2)
-ASSEMBLYAI_SPEECH_MODEL=universal-3-pro
-ASSEMBLYAI_FALLBACK_MODEL=universal-2
+# Модель распознавания для русских звонков
+ASSEMBLYAI_SPEECH_MODEL=universal-2
 # Кол-во спикеров (для телефонных звонков = 2)
 ASSEMBLYAI_SPEAKERS_EXPECTED=2
 # Multichannel: true если телефония пишет стерео (каждый спикер на своём канале)

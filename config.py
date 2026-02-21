@@ -18,9 +18,8 @@ AMOCRM_CLIENT_SECRET = os.getenv("AMOCRM_CLIENT_SECRET")
 # ============== AssemblyAI ==============
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 
-# Модель распознавания (Universal-3-Pro — лучшее качество, Universal-2 — fallback)
-ASSEMBLYAI_SPEECH_MODEL = os.getenv("ASSEMBLYAI_SPEECH_MODEL", "universal-3-pro")
-ASSEMBLYAI_FALLBACK_MODEL = os.getenv("ASSEMBLYAI_FALLBACK_MODEL", "universal-2")
+# Модель распознавания для русских звонков
+ASSEMBLYAI_SPEECH_MODEL = os.getenv("ASSEMBLYAI_SPEECH_MODEL", "universal-2")
 
 # Ожидаемое кол-во спикеров (для телефонных звонков = 2)
 ASSEMBLYAI_SPEAKERS_EXPECTED = int(os.getenv("ASSEMBLYAI_SPEAKERS_EXPECTED", "2"))

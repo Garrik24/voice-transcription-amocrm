@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from config import (
     ASSEMBLYAI_API_KEY,
     ASSEMBLYAI_SPEECH_MODEL,
-    ASSEMBLYAI_FALLBACK_MODEL,
     ASSEMBLYAI_SPEAKERS_EXPECTED,
     ASSEMBLYAI_MULTICHANNEL,
 )
@@ -56,29 +55,20 @@ class TranscriptionService:
         speaker_labels: bool,
     ) -> aai.TranscriptionConfig:
         speech_models = [ASSEMBLYAI_SPEECH_MODEL]
-        if ASSEMBLYAI_FALLBACK_MODEL and ASSEMBLYAI_FALLBACK_MODEL != ASSEMBLYAI_SPEECH_MODEL:
-            speech_models.append(ASSEMBLYAI_FALLBACK_MODEL)
 
         logger.info(
             f"AssemblyAI config: models={speech_models}, "
             f"speakers_expected={ASSEMBLYAI_SPEAKERS_EXPECTED}, "
             f"multichannel={ASSEMBLYAI_MULTICHANNEL}, "
-            f"speaker_labels={speaker_labels}, "
-            f"language_detection={'universal-3' in ASSEMBLYAI_SPEECH_MODEL}"
+            f"speaker_labels={speaker_labels}"
         )
-
-        use_lang_detection = "universal-3" in ASSEMBLYAI_SPEECH_MODEL
 
         kwargs: dict = {
             "speech_models": speech_models,
+            "language_code": language_code,
             "punctuate": True,
             "format_text": True,
         }
-
-        if use_lang_detection:
-            kwargs["language_detection"] = True
-        else:
-            kwargs["language_code"] = language_code
 
         if ASSEMBLYAI_MULTICHANNEL:
             kwargs["multichannel"] = True
