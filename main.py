@@ -13,7 +13,7 @@ from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 
-from config import PORT, DEBUG, AMOCRM_DOMAIN, validate_config
+from config import PORT, DEBUG, AMOCRM_DOMAIN, STT_PROVIDER, validate_config
 from services.amocrm import amocrm_service
 from services.transcription import transcription_service
 from services.analysis import analysis_service
@@ -215,7 +215,8 @@ async def process_call(
             analysis,
             call_type=call_type_simple,
             duration_seconds=transcription.duration_seconds,
-            manager_name=manager_name
+            manager_name=manager_name,
+            stt_provider=STT_PROVIDER,
         )
         
         # 7. Сохраняем в AmoCRM (в СДЕЛКУ!)
@@ -586,7 +587,8 @@ async def process_uploaded_audio(
             analysis,
             call_type=call_type_simple,
             duration_seconds=transcription.duration_seconds,
-            manager_name=manager_name
+            manager_name=manager_name,
+            stt_provider=STT_PROVIDER,
         )
         
         # 5. Сохраняем в AmoCRM (в СДЕЛКУ!)

@@ -989,16 +989,18 @@ class AnalysisService:
             raise
     
     def format_note(
-        self, 
+        self,
         analysis: CallAnalysis,
         call_type: str = "outgoing",
         duration_seconds: float = 0,
         manager_name: str = "Менеджер",
         model_used: Optional[str] = None,
+        stt_provider: Optional[str] = None,
     ) -> str:
         """
         Форматирует результат анализа в примечание для AmoCRM.
         model_used: например "openai/gpt-4o-mini" или "gemini/gemini-2.0-flash-001"
+        stt_provider: например "whisper", "assemblyai", "yandex"
         """
         minutes = int(duration_seconds // 60)
         seconds = int(duration_seconds % 60)
@@ -1008,6 +1010,9 @@ class AnalysisService:
         provider = (LLM_PROVIDER or "openai").strip().lower()
         model_name = model_used or (f"{provider}/{GEMINI_MODEL}" if provider == "gemini" else f"{provider}/{OPENAI_MODEL}")
 
+        stt_label = (stt_provider or "assemblyai").strip().lower()
+        stt_display = {"whisper": "Whisper", "assemblyai": "AssemblyAI", "yandex": "Yandex"}.get(stt_label, stt_label)
+
         steps_block = ""
         if analysis.next_steps:
             steps_block = "\n\n✅ Следующие шаги:\n" + "\n".join([f"- {s}" for s in analysis.next_steps])
@@ -1015,8 +1020,8 @@ class AnalysisService:
         participants_block = ""
         if analysis.speaker_stats and analysis.speaker_stats.participant_count > 0:
             participants_block = f"\n👥 Участники: {analysis.speaker_stats.participant_count}"
-        
-        note = f"""🎙️ АНАЛИЗ ЗВОНКА (AI) [{model_name}]
+
+        note = f"""🎙️ АНАЛИЗ ЗВОНКА (AI) [{model_name} | STT: {stt_display}]
 
 📞 {call_type_str} | {duration_str}
 {participants_block}
@@ -1034,7 +1039,7 @@ class AnalysisService:
 💳 Оплата: {analysis.payment_terms}
 📊 Итог: {analysis.call_result}
 📅 Следующий контакт: {analysis.next_contact_date}{steps_block}"""
-        
+
         return note
 
 
