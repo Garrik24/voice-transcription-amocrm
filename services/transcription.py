@@ -1,8 +1,9 @@
 """
 Сервис транскрибации.
-Поддерживает два провайдера (STT_PROVIDER):
+Поддерживает три провайдера (STT_PROVIDER):
   - assemblyai (по умолчанию): AssemblyAI SDK с диаризацией
-  - yandex: Yandex SpeechKit Async REST API с поканальной диаризацией
+  - whisper: OpenAI Whisper API — отличный русский, файл напрямую, без хранилища
+  - yandex: Yandex SpeechKit Async REST API (требует Object Storage)
 """
 import asyncio
 import base64
@@ -10,17 +11,18 @@ import httpx
 import logging
 import os
 import tempfile
-import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import assemblyai as aai
+from openai import AsyncOpenAI
 
 from config import (
     ASSEMBLYAI_API_KEY,
     ASSEMBLYAI_MULTICHANNEL,
     ASSEMBLYAI_SPEAKERS_EXPECTED,
     ASSEMBLYAI_SPEECH_MODEL,
+    OPENAI_API_KEY,
     STT_PROVIDER,
     YANDEX_API_KEY,
     YANDEX_STT_LANGUAGE,
@@ -63,6 +65,7 @@ class TranscriptionService:
 
     def __init__(self):
         self.transcriber = aai.Transcriber()
+        self._openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
     # -------------------------------------------------------------------------
     # Public API
@@ -88,7 +91,9 @@ class TranscriptionService:
         provider = STT_PROVIDER
         logger.info(f"🎙️ STT провайдер: {provider}")
 
-        if provider == "yandex":
+        if provider == "whisper":
+            return await self._transcribe_whisper(audio_data)
+        elif provider == "yandex":
             return await self._transcribe_yandex(audio_data, speaker_labels)
         else:
             return await self._transcribe_assemblyai(audio_data, language_code, speaker_labels)
@@ -129,6 +134,66 @@ class TranscriptionService:
             role = roles.get(speaker.label, f"Говорящий {speaker.label}")
             lines.append(f"[{role}]: {speaker.text}")
         return "\n".join(lines)
+
+    # -------------------------------------------------------------------------
+    # OpenAI Whisper
+    # -------------------------------------------------------------------------
+
+    async def _transcribe_whisper(self, audio_data: bytes) -> TranscriptionResult:
+        """
+        Транскрибация через OpenAI Whisper API.
+        Отличное качество русского языка, принимает файл напрямую (до 25 МБ).
+        Диаризация не поддерживается — возвращает полный текст единым блоком.
+        """
+        logger.info(f"📁 Размер аудио: {len(audio_data)} байт")
+
+        # Определяем формат файла
+        suffix = ".mp3"
+        mime = "audio/mpeg"
+        if audio_data[:4] == b'RIFF':
+            suffix = ".wav"
+            mime = "audio/wav"
+        elif audio_data[:4] == b'OggS':
+            suffix = ".ogg"
+            mime = "audio/ogg"
+        elif audio_data[:4] == b'fLaC':
+            suffix = ".flac"
+            mime = "audio/flac"
+
+        logger.info(f"📁 Формат: {suffix}, MIME: {mime}")
+        logger.info("🎙️ Отправляем в OpenAI Whisper (whisper-1)...")
+
+        filename = f"audio{suffix}"
+
+        response = await self._openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=(filename, audio_data, mime),
+            language="ru",
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+        )
+
+        full_text = response.text or ""
+        segments = getattr(response, "segments", []) or []
+        duration_seconds = 0.0
+        if segments:
+            duration_seconds = float(segments[-1].get("end", 0) if isinstance(segments[-1], dict)
+                                     else getattr(segments[-1], "end", 0))
+
+        logger.info(
+            f"Транскрибация завершена (Whisper): {len(full_text)} символов, "
+            f"{len(segments)} сегментов, {duration_seconds:.1f} сек"
+        )
+
+        return TranscriptionResult(
+            full_text=full_text,
+            speakers=[],
+            formatted_text=full_text,
+            duration_seconds=duration_seconds,
+            confidence=1.0,
+            language="ru",
+            roles_from_ai=False,
+        )
 
     # -------------------------------------------------------------------------
     # Yandex SpeechKit
