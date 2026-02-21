@@ -314,17 +314,31 @@ async def test_telegram():
     Проверка отправки в Telegram.
     Вызови: GET /test-telegram — должно прийти тестовое сообщение.
     """
+    import httpx as _httpx
     tok = telegram_service.bot_token or ""
-    ok = await telegram_service.send_message(
-        "🧪 <b>Тест</b>: сервис транскрибации работает. Telegram подключён.",
-        disable_notification=True
-    )
+    error_detail = None
+    ok = False
+    try:
+        async with _httpx.AsyncClient(verify=False, timeout=15.0) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{tok}/sendMessage",
+                json={"chat_id": telegram_service.chat_id, "text": "🧪 Тест Telegram Railway"},
+            )
+            ok = r.status_code == 200
+            if not ok:
+                error_detail = f"HTTP {r.status_code}: {r.text[:300]}"
+    except _httpx.ConnectError as e:
+        error_detail = f"ConnectError: {str(e)[:300]}"
+    except _httpx.TimeoutException as e:
+        error_detail = f"Timeout: {str(e)[:300]}"
+    except Exception as e:
+        error_detail = f"{type(e).__name__}: {str(e)[:300]}"
     return {
         "telegram_ok": ok,
+        "error": error_detail,
         "token_prefix": tok[:8] if tok else "NOT_SET",
         "token_len": len(tok),
         "chat_id": telegram_service.chat_id,
-        "is_configured": telegram_service.is_configured,
     }
 
 
