@@ -337,6 +337,7 @@ async def test_telegram():
         "telegram_ok": ok,
         "error": error_detail,
         "token_prefix": tok[:8] if tok else "NOT_SET",
+        "token_chars_11_15": tok[11:15] if len(tok) > 14 else "SHORT",
         "token_len": len(tok),
         "chat_id": telegram_service.chat_id,
     }
