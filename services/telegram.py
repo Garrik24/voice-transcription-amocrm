@@ -59,6 +59,9 @@ class TelegramService:
                 logger.info("Сообщение отправлено в Telegram")
                 return True
                 
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Ошибка отправки в Telegram: HTTP {e.response.status_code} — {e.response.text[:200]}")
+            return False
         except Exception as e:
             logger.error(f"Ошибка отправки в Telegram: {e}")
             return False

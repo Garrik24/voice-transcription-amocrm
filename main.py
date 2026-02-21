@@ -265,7 +265,7 @@ async def process_call(
             logger.info(f"🕐 Время звонка (текущее): МСК={call_datetime}")
         amocrm_url = f"https://{AMOCRM_DOMAIN}/{target_entity_type}/detail/{lead_id}"
         
-        await telegram_service.send_call_analysis(
+        tg_ok = await telegram_service.send_call_analysis(
             call_datetime=call_datetime,
             call_type=call_type_simple,
             phone=phone or "Не определён",
@@ -282,6 +282,8 @@ async def process_call(
             next_contact_date=analysis.next_contact_date,
             next_steps=analysis.next_steps,
         )
+        if not tg_ok:
+            logger.warning(f"⚠️ Telegram: уведомление не отправлено (проверьте TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID)")
         
         logger.info(f"✅ Звонок для сделки #{lead_id} успешно обработан!")
         
@@ -304,6 +306,19 @@ async def root():
 async def health():
     """Health check для Railway"""
     return {"status": "healthy"}
+
+
+@app.get("/test-telegram")
+async def test_telegram():
+    """
+    Проверка отправки в Telegram.
+    Вызови: GET /test-telegram — должно прийти тестовое сообщение.
+    """
+    ok = await telegram_service.send_message(
+        "🧪 <b>Тест</b>: сервис транскрибации работает. Telegram подключён.",
+        disable_notification=True
+    )
+    return {"telegram_ok": ok}
 
 
 @app.post("/webhook/amocrm")
@@ -612,7 +627,7 @@ async def process_uploaded_audio(
             logger.info(f"🕐 Время звонка (upload, текущее): МСК={call_datetime}")
         amocrm_url = f"https://{AMOCRM_DOMAIN}/leads/detail/{lead_id}"
         
-        await telegram_service.send_call_analysis(
+        tg_ok = await telegram_service.send_call_analysis(
             call_datetime=call_datetime,
             call_type=call_type_simple,
             phone=phone or "Не определён",
@@ -629,6 +644,8 @@ async def process_uploaded_audio(
             next_contact_date=analysis.next_contact_date,
             next_steps=analysis.next_steps,
         )
+        if not tg_ok:
+            logger.warning(f"⚠️ Telegram: уведомление не отправлено (проверьте TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID)")
         
         logger.info(f"✅ Загруженный файл для сделки #{lead_id} обработан!")
         
