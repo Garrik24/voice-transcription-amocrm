@@ -43,7 +43,7 @@ class TelegramService:
         if not self.is_configured:
             logger.warning("Telegram не настроен, пропускаем отправку")
             return False
-        
+
         try:
             async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
                 response = await client.post(
@@ -58,7 +58,18 @@ class TelegramService:
                 response.raise_for_status()
                 logger.info("Сообщение отправлено в Telegram")
                 return True
-                
+
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Telegram API вернул ошибку: HTTP {e.response.status_code} — {e.response.text[:200]}"
+            )
+            return False
+        except httpx.ConnectError as e:
+            logger.error(
+                f"Telegram недоступен (соединение не установлено): {e}. "
+                "Проверьте: 1) токен в Railway Variables, 2) доступность api.telegram.org (VPN/прокси)"
+            )
+            return False
         except Exception as e:
             logger.error(f"Ошибка отправки в Telegram: {e}")
             return False

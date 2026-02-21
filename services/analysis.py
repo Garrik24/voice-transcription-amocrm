@@ -794,7 +794,9 @@ class AnalysisService:
             call_type_ru = "Входящий" if call_type == "incoming" else "Исходящий"
 
             provider = (LLM_PROVIDER or "openai").strip().lower()
-            
+            model_name = GEMINI_MODEL if provider == "gemini" else OPENAI_MODEL
+            logger.info(f"🤖 Анализ через {provider}/{model_name}")
+
             # Адаптируем max_tokens в зависимости от длины звонка
             if is_long_call:
                 max_tokens = OPENAI_MAX_TOKENS
@@ -991,15 +993,20 @@ class AnalysisService:
         analysis: CallAnalysis,
         call_type: str = "outgoing",
         duration_seconds: float = 0,
-        manager_name: str = "Менеджер"
+        manager_name: str = "Менеджер",
+        model_used: Optional[str] = None,
     ) -> str:
         """
         Форматирует результат анализа в примечание для AmoCRM.
+        model_used: например "openai/gpt-4o-mini" или "gemini/gemini-2.0-flash-001"
         """
         minutes = int(duration_seconds // 60)
         seconds = int(duration_seconds % 60)
         duration_str = f"{minutes} мин {seconds} сек" if minutes else f"{seconds} сек"
         call_type_str = "Исходящий" if call_type == "outgoing" else "Входящий"
+
+        provider = (LLM_PROVIDER or "openai").strip().lower()
+        model_name = model_used or (f"{provider}/{GEMINI_MODEL}" if provider == "gemini" else f"{provider}/{OPENAI_MODEL}")
 
         steps_block = ""
         if analysis.next_steps:
@@ -1009,7 +1016,7 @@ class AnalysisService:
         if analysis.speaker_stats and analysis.speaker_stats.participant_count > 0:
             participants_block = f"\n👥 Участники: {analysis.speaker_stats.participant_count}"
         
-        note = f"""🎙️ АНАЛИЗ ЗВОНКА (AI)
+        note = f"""🎙️ АНАЛИЗ ЗВОНКА (AI) [{model_name}]
 
 📞 {call_type_str} | {duration_str}
 {participants_block}
