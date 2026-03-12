@@ -20,6 +20,157 @@ from services.transcription import transcription_service
 from services.analysis import analysis_service
 from services.telegram import telegram_service
 
+# ============== Маппинг work_type → enum_id для поля "Интерес" (field_id=212083) ==============
+WORK_TYPE_ENUM_MAP = {
+    "межевание": 423475,
+    "вынос": 423477,
+    "вынос в натуру": 423477,
+    "вынос границ": 423477,
+    "топосъёмка": 423479,
+    "топосъемка": 423479,
+    "топографическая съёмка": 423479,
+    "топографическая съемка": 423479,
+    "техплан": 423495,
+    "технический план": 423495,
+    "техпаспорт": 1265209,
+    "технический паспорт": 1265209,
+    "акт обследования": 1276685,
+    "схема": 423483,
+    "схема на кпт": 423483,
+    "геодезическое сопровождение": 1329477,
+    "геодезия": 1329477,
+    "раздел": 423507,
+    "раздел зу": 423507,
+    "разбивка": 423505,
+    "исполнительная съемка": 1276379,
+    "исполнительная съёмка": 1276379,
+    "проектирование": 423491,
+    "геология": 423493,
+    "экология": 423497,
+    "подбор зу": 1342589,
+    "межевание и тех план": 1344645,
+    "межевание и техплан": 1344645,
+}
+
+
+def _match_work_type_enum(work_type_text: str):
+    """Ищет enum_id для поля Интерес по тексту work_type из анализа."""
+    if not work_type_text:
+        return None
+    text = work_type_text.lower().strip()
+    # Точное совпадение
+    if text in WORK_TYPE_ENUM_MAP:
+        return WORK_TYPE_ENUM_MAP[text]
+    # Частичное совпадение
+    for keyword, enum_id in WORK_TYPE_ENUM_MAP.items():
+        if keyword in text:
+            return enum_id
+    return None
+
+
+def _parse_price(cost_text: str):
+    """Извлекает числовую стоимость из текста (например '25 000 ₽' → 25000)."""
+    if not cost_text or cost_text.lower() in ("не обсуждали", "не указано", "не определено"):
+        return None
+    import re
+    digits = re.sub(r"[^\d]", "", cost_text)
+    if digits:
+        price = int(digits)
+        if price > 0:
+            return price
+    return None
+
+
+async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
+    """
+    Автоматически заполняет поля сделки на основе AI-анализа звонка.
+    Заполняет ТОЛЬКО пустые поля — не перезаписывает то, что менеджер уже заполнил.
+    """
+    try:
+        # Получаем текущие данные сделки
+        lead_data = await amocrm_service.get_lead(lead_id)
+        if not lead_data:
+            logger.warning(f"⚠️ Не удалось получить сделку #{lead_id} для автозаполнения")
+            return
+
+        # Собираем уже заполненные поля
+        existing_fields = {}
+        for cf in (lead_data.get("custom_fields_values") or []):
+            fid = cf.get("field_id")
+            vals = cf.get("values", [])
+            if vals and vals[0].get("value"):
+                existing_fields[fid] = vals[0]["value"]
+
+        existing_price = lead_data.get("price", 0)
+
+        custom_fields = []
+        price_to_set = None
+
+        # 1. Город (field_id=212029, text)
+        if 212029 not in existing_fields:
+            city = getattr(analysis, "client_city", "")
+            if city and city.lower() not in ("не указано", "не определено", ""):
+                custom_fields.append({
+                    "field_id": 212029,
+                    "values": [{"value": city}]
+                })
+                logger.info(f"  📍 Город: {city}")
+
+        # 2. Интерес / work_type (field_id=212083, select)
+        if 212083 not in existing_fields:
+            work_type = getattr(analysis, "work_type", "")
+            if work_type and work_type.lower() not in ("консультация", "не обсуждали", "не указано", ""):
+                enum_id = _match_work_type_enum(work_type)
+                if enum_id:
+                    custom_fields.append({
+                        "field_id": 212083,
+                        "values": [{"enum_id": enum_id}]
+                    })
+                    logger.info(f"  🔧 Интерес: {work_type} → enum_id={enum_id}")
+
+        # 3. Тип сделки (field_id=212099, select: входящий=423541, исходящий=423543)
+        if 212099 not in existing_fields:
+            enum_id = 423541 if call_type_simple == "incoming" else 423543
+            custom_fields.append({
+                "field_id": 212099,
+                "values": [{"enum_id": enum_id}]
+            })
+            logger.info(f"  📞 Тип сделки: {call_type_simple}")
+
+        # 4. Схема оплаты (field_id=767917, text)
+        if 767917 not in existing_fields:
+            payment = getattr(analysis, "payment_terms", "")
+            if payment and payment.lower() not in ("не обсуждали", "не указано", "не определено", ""):
+                custom_fields.append({
+                    "field_id": 767917,
+                    "values": [{"value": payment}]
+                })
+                logger.info(f"  💳 Схема оплаты: {payment}")
+
+        # 5. Бюджет сделки (встроенное поле price)
+        if not existing_price or existing_price == 0:
+            cost = getattr(analysis, "cost", "")
+            parsed_price = _parse_price(cost)
+            if parsed_price:
+                price_to_set = parsed_price
+                logger.info(f"  💰 Бюджет: {parsed_price}")
+
+        # Отправляем PATCH если есть что обновлять
+        if custom_fields or price_to_set is not None:
+            logger.info(f"📝 Автозаполнение сделки #{lead_id}: {len(custom_fields)} полей" +
+                        (f" + бюджет {price_to_set}" if price_to_set else ""))
+            await amocrm_service.update_lead_fields(
+                lead_id=lead_id,
+                custom_fields_values=custom_fields if custom_fields else None,
+                price=price_to_set,
+            )
+        else:
+            logger.info(f"⏭️ Автозаполнение #{lead_id}: нечего обновлять (поля уже заполнены или данных нет)")
+
+    except Exception as e:
+        # Не валим основной пайплайн из-за ошибки автозаполнения
+        logger.error(f"❌ Ошибка автозаполнения сделки #{lead_id}: {e}")
+
 # Настраиваем логирование
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -219,7 +370,11 @@ async def process_call(
             manager_name=manager_name,
             speakers=transcription.speakers,
         )
-        
+
+        # 5.5. Автозаполнение полей сделки
+        if target_entity_type == "leads":
+            await auto_fill_lead_fields(lead_id, analysis, call_type_simple)
+
         # 6. Формируем примечание
         note_text = analysis_service.format_note(
             analysis,

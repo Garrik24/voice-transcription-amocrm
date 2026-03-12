@@ -677,6 +677,48 @@ class AmoCRMService:
         logger.info(f"✅ Создана новая сделка #{new_lead_id} для контакта #{contact_id}")
         return new_lead_id
 
+    async def update_lead_fields(
+        self,
+        lead_id: int,
+        custom_fields_values: list = None,
+        price: int = None,
+        name: str = None,
+    ) -> bool:
+        """
+        Обновляет поля сделки через PATCH /api/v4/leads/{id}.
+
+        Args:
+            lead_id: ID сделки
+            custom_fields_values: Список custom fields в формате amoCRM API
+            price: Бюджет сделки (встроенное поле)
+            name: Название сделки
+        """
+        body = {}
+        if custom_fields_values:
+            body["custom_fields_values"] = custom_fields_values
+        if price is not None:
+            body["price"] = price
+        if name is not None:
+            body["name"] = name
+
+        if not body:
+            logger.info(f"⏭️ Нечего обновлять в сделке #{lead_id}")
+            return True
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+                response = await client.patch(
+                    f"{self.base_url}/leads/{lead_id}",
+                    headers=self.headers,
+                    json=body,
+                )
+                response.raise_for_status()
+                logger.info(f"✅ Поля сделки #{lead_id} обновлены: {list(body.keys())}")
+                return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления полей сделки #{lead_id}: {e}")
+            return False
+
 
 # Синглтон для использования во всём приложении
 amocrm_service = AmoCRMService()
