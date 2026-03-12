@@ -70,15 +70,48 @@ def _match_work_type_enum(work_type_text: str):
 
 def _parse_price(cost_text: str):
     """Извлекает числовую стоимость из текста (например '25 000 ₽' → 25000)."""
-    if not cost_text or cost_text.lower() in ("не обсуждали", "не указано", "не определено"):
+    if not cost_text:
+        return None
+    normalized = cost_text.lower().strip()
+    if normalized in ("не обсуждали", "не указано", "не определено", ""):
         return None
     import re
-    digits = re.sub(r"[^\d]", "", cost_text)
+
+    # Сначала ищем сумму рядом с валютой.
+    with_currency = re.findall(r"(\d[\d\s]{0,14}\d|\d+)\s*(?:₽|руб(?:\.|ля|лей)?)", normalized)
+    if with_currency:
+        candidate = with_currency[0]
+    else:
+        # Фолбэк: любое число в тексте.
+        any_numbers = re.findall(r"\d[\d\s]{0,14}\d|\d+", normalized)
+        if not any_numbers:
+            return None
+        candidate = any_numbers[0]
+
+    digits = re.sub(r"[^\d]", "", candidate)
     if digits:
         price = int(digits)
-        if price > 0:
+        # Санитарные границы: от 1 тыс. до 50 млн.
+        if 1_000 <= price <= 50_000_000:
             return price
     return None
+
+
+def _has_custom_field_value(custom_field: dict) -> bool:
+    """Проверяет, что у custom field есть фактическое значение любого типа."""
+    for val in (custom_field.get("values") or []):
+        if not isinstance(val, dict):
+            continue
+        for key in ("value", "enum_id", "enum_code", "file_id", "text"):
+            raw = val.get(key)
+            if raw is None:
+                continue
+            if isinstance(raw, str):
+                if raw.strip():
+                    return True
+                continue
+            return True
+    return False
 
 
 async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
@@ -94,12 +127,11 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
             return
 
         # Собираем уже заполненные поля
-        existing_fields = {}
+        existing_fields = set()
         for cf in (lead_data.get("custom_fields_values") or []):
             fid = cf.get("field_id")
-            vals = cf.get("values", [])
-            if vals and vals[0].get("value"):
-                existing_fields[fid] = vals[0]["value"]
+            if fid and _has_custom_field_value(cf):
+                existing_fields.add(fid)
 
         existing_price = lead_data.get("price", 0)
 
@@ -159,11 +191,13 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
         if custom_fields or price_to_set is not None:
             logger.info(f"📝 Автозаполнение сделки #{lead_id}: {len(custom_fields)} полей" +
                         (f" + бюджет {price_to_set}" if price_to_set else ""))
-            await amocrm_service.update_lead_fields(
+            updated = await amocrm_service.update_lead_fields(
                 lead_id=lead_id,
                 custom_fields_values=custom_fields if custom_fields else None,
                 price=price_to_set,
             )
+            if not updated:
+                logger.warning(f"⚠️ PATCH сделки #{lead_id} вернул ошибку (см. лог выше)")
         else:
             logger.info(f"⏭️ Автозаполнение #{lead_id}: нечего обновлять (поля уже заполнены или данных нет)")
 

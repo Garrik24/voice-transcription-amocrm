@@ -7,7 +7,7 @@ import httpx
 import ssl
 import logging
 from typing import Optional, Dict, Any
-from config import AMOCRM_DOMAIN, AMOCRM_ACCESS_TOKEN, MANAGERS
+from config import AMOCRM_DOMAIN, AMOCRM_ACCESS_TOKEN, AMOCRM_VERIFY_SSL, MANAGERS
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,7 @@ class AmoCRMService:
     
     def __init__(self):
         self.base_url = f"https://{AMOCRM_DOMAIN}/api/v4"
+        self.verify_ssl = AMOCRM_VERIFY_SSL
         self.headers = {
             "Authorization": f"Bearer {AMOCRM_ACCESS_TOKEN}",
             "Content-Type": "application/json"
@@ -706,7 +707,7 @@ class AmoCRMService:
             return True
 
         try:
-            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            async with httpx.AsyncClient(timeout=30.0, verify=self.verify_ssl) as client:
                 response = await client.patch(
                     f"{self.base_url}/leads/{lead_id}",
                     headers=self.headers,

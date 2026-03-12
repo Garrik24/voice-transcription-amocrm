@@ -14,6 +14,7 @@ AMOCRM_ACCESS_TOKEN = os.getenv("AMOCRM_ACCESS_TOKEN")
 AMOCRM_REFRESH_TOKEN = os.getenv("AMOCRM_REFRESH_TOKEN")
 AMOCRM_CLIENT_ID = os.getenv("AMOCRM_CLIENT_ID")
 AMOCRM_CLIENT_SECRET = os.getenv("AMOCRM_CLIENT_SECRET")
+AMOCRM_VERIFY_SSL = os.getenv("AMOCRM_VERIFY_SSL", "true").strip().lower() == "true"
 
 # ============== STT Provider ==============
 # assemblyai | yandex
