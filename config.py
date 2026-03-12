@@ -17,7 +17,7 @@ AMOCRM_CLIENT_SECRET = os.getenv("AMOCRM_CLIENT_SECRET")
 
 # ============== STT Provider ==============
 # assemblyai | yandex
-STT_PROVIDER = os.getenv("STT_PROVIDER", "assemblyai").strip().lower()
+STT_PROVIDER = os.getenv("STT_PROVIDER", "whisper").strip().lower()
 
 # ============== AssemblyAI ==============
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
