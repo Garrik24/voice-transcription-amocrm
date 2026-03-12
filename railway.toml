@@ -1,9 +1,3 @@
-[build]
-builder = "nixpacks"
-
-[build.nixpacksPlan.phases.setup]
-nixPkgs = ["ffmpeg"]
-
 [deploy]
 healthcheckPath = "/health"
 healthcheckTimeout = 100
