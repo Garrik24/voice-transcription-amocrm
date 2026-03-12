@@ -2,7 +2,10 @@ FROM python:3.12-slim
 
 # Устанавливаем ffmpeg
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "=== ffmpeg installed ===" \
+    && which ffmpeg && ffmpeg -version \
+    && which ffprobe && ffprobe -version
 
 WORKDIR /app
 

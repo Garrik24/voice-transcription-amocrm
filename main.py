@@ -7,6 +7,7 @@ FastAPI сервер с webhook endpoint для AmoCRM.
 """
 import logging
 import asyncio
+import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
@@ -62,8 +63,17 @@ async def lifespan(app: FastAPI):
             logger.warning(f"⚠️ Не все переменные окружения заданы: {', '.join(missing)}")
         else:
             logger.info("✅ Конфигурация валидна")
-        # Не спамим в Telegram при каждом старте
-        # await telegram_service.send_startup()
+
+        # Проверяем наличие ffmpeg (нужен для стерео-диаризации)
+        ffmpeg_path = shutil.which("ffmpeg")
+        ffprobe_path = shutil.which("ffprobe")
+        if ffmpeg_path and ffprobe_path:
+            logger.info(f"✅ ffmpeg найден: {ffmpeg_path}")
+            logger.info(f"✅ ffprobe найден: {ffprobe_path}")
+        else:
+            logger.warning(f"⚠️ ffmpeg={'найден' if ffmpeg_path else 'НЕ НАЙДЕН'}, ffprobe={'найден' if ffprobe_path else 'НЕ НАЙДЕН'}")
+            logger.warning("⚠️ Стерео-диаризация будет недоступна, fallback на mono Whisper")
+
         logger.info("🟢 Сервер запущен")
     except Exception as e:
         # Не валим старт: пусть поднимется хотя бы healthcheck.
