@@ -169,15 +169,15 @@ class TranscriptionService:
 
         cmd_left = [
             "ffmpeg", "-y", "-i", input_path,
-            "-map_channel", "0.0.0",
-            "-ac", "1", "-ab", "64k", "-ar", "16000",
+            "-af", "pan=mono|c0=c0",
+            "-ab", "64k", "-ar", "16000",
             left_path
         ]
 
         cmd_right = [
             "ffmpeg", "-y", "-i", input_path,
-            "-map_channel", "0.0.1",
-            "-ac", "1", "-ab", "64k", "-ar", "16000",
+            "-af", "pan=mono|c0=c1",
+            "-ab", "64k", "-ar", "16000",
             right_path
         ]
 
