@@ -187,14 +187,44 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
                 price_to_set = parsed_price
                 logger.info(f"  💰 Бюджет: {parsed_price}")
 
+        # 6. Адрес объекта (field_id=768529, text)
+        if 768529 not in existing_fields:
+            location = getattr(analysis, "location", "")
+            if location and location.lower() not in ("не указано", "не определено", ""):
+                custom_fields.append({
+                    "field_id": 768529,
+                    "values": [{"value": location}]
+                })
+                logger.info(f"  📍 Адрес объекта: {location}")
+
+        # 7. Название сделки: "{work_type} {location}" — только если текущее дефолтное
+        name_to_set = None
+        existing_name = lead_data.get("name", "") or ""
+        is_default_name = (
+            not existing_name
+            or existing_name.startswith("Входящий звонок")
+            or existing_name.startswith("Исходящий звонок")
+        )
+        if is_default_name:
+            work_type = getattr(analysis, "work_type", "")
+            location = getattr(analysis, "location", "")
+            if work_type and work_type.lower() not in ("консультация", "не определено", ""):
+                if location and location.lower() not in ("не указано", "не определено", ""):
+                    name_to_set = f"{work_type} {location}"
+                else:
+                    name_to_set = work_type
+                logger.info(f"  🏷️ Название сделки: {name_to_set}")
+
         # Отправляем PATCH если есть что обновлять
-        if custom_fields or price_to_set is not None:
+        if custom_fields or price_to_set is not None or name_to_set is not None:
             logger.info(f"📝 Автозаполнение сделки #{lead_id}: {len(custom_fields)} полей" +
-                        (f" + бюджет {price_to_set}" if price_to_set else ""))
+                        (f" + бюджет {price_to_set}" if price_to_set else "") +
+                        (f" + название '{name_to_set}'" if name_to_set else ""))
             updated = await amocrm_service.update_lead_fields(
                 lead_id=lead_id,
                 custom_fields_values=custom_fields if custom_fields else None,
                 price=price_to_set,
+                name=name_to_set,
             )
             if not updated:
                 logger.warning(f"⚠️ PATCH сделки #{lead_id} вернул ошибку (см. лог выше)")
@@ -412,6 +442,25 @@ async def process_call(
         # 5.5. Автозаполнение полей сделки
         if target_entity_type == "leads":
             await auto_fill_lead_fields(lead_id, analysis, call_type_simple)
+
+        # 5.6. Обновление имени контакта (если привязан к контакту)
+        normalized_check_type = entity_type.lower()
+        if normalized_check_type in ["contact", "contacts"]:
+            contact_id = entity_id  # entity_id = исходный ID контакта
+            client_name = getattr(analysis, "client_name", "")
+            if client_name and client_name.lower() not in ("клиент", "не представился", ""):
+                # Проверяем, что текущее имя дефолтное (номер телефона или пустое)
+                contact_data = await amocrm_service.get_contact(contact_id)
+                if contact_data:
+                    current_name = contact_data.get("name", "") or ""
+                    # Считаем дефолтным: пустое, или начинается с цифры/+  (номер телефона)
+                    is_default = (
+                        not current_name
+                        or current_name.lstrip("+").replace(" ", "").replace("-", "").isdigit()
+                    )
+                    if is_default:
+                        await amocrm_service.update_contact_name(contact_id, client_name)
+                        logger.info(f"  👤 Имя контакта #{contact_id}: '{current_name}' → '{client_name}'")
 
         # 6. Формируем примечание
         note_text = analysis_service.format_note(

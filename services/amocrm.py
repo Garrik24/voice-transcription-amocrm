@@ -720,6 +720,24 @@ class AmoCRMService:
             logger.error(f"❌ Ошибка обновления полей сделки #{lead_id}: {e}")
             return False
 
+    async def update_contact_name(self, contact_id: int, name: str) -> bool:
+        """
+        Обновляет имя контакта через PATCH /api/v4/contacts/{id}.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=30.0, verify=self.verify_ssl) as client:
+                response = await client.patch(
+                    f"{self.base_url}/contacts/{contact_id}",
+                    headers=self.headers,
+                    json={"name": name},
+                )
+                response.raise_for_status()
+                logger.info(f"✅ Имя контакта #{contact_id} обновлено: {name}")
+                return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления имени контакта #{contact_id}: {e}")
+            return False
+
 
 # Синглтон для использования во всём приложении
 amocrm_service = AmoCRMService()
