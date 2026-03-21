@@ -98,6 +98,7 @@ class CallAnalysis:
     # Дополнительные поля
     client_city: str  # Город клиента
     work_type: str  # Тип работы
+    location: str  # Адрес/район/ориентир объекта
     cost: str  # Стоимость
     payment_terms: str  # Условия оплаты
     call_result: str  # Итог звонка
@@ -225,6 +226,13 @@ work_type:
   - Если несколько видов работ → перечисли через запятую
   - Если неясно → "Не определено"
 
+location:
+  Адрес, район или ориентир объекта работ. Краткая форма для названия сделки.
+  Ищи: улицу, шоссе, район, СНТ, КП, посёлок, ориентир рядом с объектом.
+  Примеры: "Старомарьское шоссе", "ул. Ленина 15", "СНТ Солнечный", "п. Иноземцево", "р-н Юго-Западный"
+  ВАЖНО: НЕ дублируй город — только адрес/район/ориентир. Пиши кратко (2-4 слова).
+  Если не упоминалось → "Не указано"
+
 6. Формат ответа
 Верни ТОЛЬКО валидный JSON. Никакого текста до или после JSON.
 {{{{
@@ -233,6 +241,7 @@ work_type:
   "summary": "string",
   "client_city": "string",
   "work_type": "string",
+  "location": "string",
   "cost": "string",
   "payment_terms": "string",
   "call_result": "string",
@@ -263,6 +272,7 @@ work_type:
   "summary": "Клиент Давид — вынос границ участка (~80 соток, ровная форма), район Старомарьского шоссе, рядом с автосалоном Хрополь / «Четыре сезона». GPS в этом районе глушится — вынос по GPS 4 000 ₽, если не ловит — геодезический ход от 25 000 ₽. Порекомендовал обратиться Алексей из компании. Договорились: Давид скинет кадастровый номер в Telegram, после чего будет определена точная цена и дата выезда.",
   "client_city": "Не указано",
   "work_type": "Вынос границ",
+  "location": "Старомарьское шоссе",
   "cost": "4 000 ₽ за вынос по GPS, от 25 000 ₽ за геодезический ход",
   "payment_terms": "Не обсуждали",
   "call_result": "Согласие",
@@ -344,6 +354,7 @@ VERIFY_FIELDS = [
     "manager_name",
     "client_city",
     "work_type",
+    "location",
     "cost",
     "payment_terms",
     "call_result",
@@ -356,6 +367,7 @@ FIELD_DEFAULTS: Dict[str, Any] = {
     "manager_name": "Менеджер",
     "client_city": "Не указано",
     "work_type": "Консультация",
+    "location": "Не указано",
     "cost": "Не обсуждали",
     "payment_terms": "Не обсуждали",
     "call_result": "Не определено",
@@ -1021,6 +1033,7 @@ class AnalysisService:
                 summary=result_json.get("summary", ""),
                 client_city=result_json.get("client_city", "Не указано"),
                 work_type=result_json.get("work_type", "Консультация"),
+                location=result_json.get("location", "Не указано"),
                 cost=result_json.get("cost", "Не обсуждали"),
                 payment_terms=result_json.get("payment_terms", "Не обсуждали"),
                 call_result=result_json.get("call_result", "Не определено"),
