@@ -208,6 +208,7 @@ next_contact_date (дата следующего контакта):
 ANALYSIS_USER_PROMPT = """Проанализируй разговор между менеджером и клиентом.
 
 Тип звонка: {call_type}
+{call_direction_context}
 Менеджер компании: {manager_name}
 
 ПОМНИ: {manager_name} = МЕНЕДЖЕР (не клиент!)
@@ -773,11 +774,12 @@ class AnalysisService:
         return prepared
     
     async def analyze_call(
-        self, 
+        self,
         transcript: str,
         call_type: str = "outgoing",
         manager_name: str = "Менеджер",
         speakers: Optional[List[Any]] = None,
+        call_direction: str = "call_in",
     ) -> CallAnalysis:
         """
         Анализирует транскрибацию звонка и извлекает структурированные данные.
@@ -792,6 +794,11 @@ class AnalysisService:
             is_long_call = len(transcript) > 8000  # примерно 5+ минут
             
             call_type_ru = "Входящий" if call_type == "incoming" else "Исходящий"
+
+            if call_direction == "call_out":
+                call_direction_context = "Это ИСХОДЯЩИЙ звонок — менеджер позвонил клиенту."
+            else:
+                call_direction_context = "Это ВХОДЯЩИЙ звонок — клиент позвонил в компанию."
 
             provider = (LLM_PROVIDER or "openai").strip().lower()
             model_name = GEMINI_MODEL if provider == "gemini" else OPENAI_MODEL
@@ -846,6 +853,7 @@ class AnalysisService:
                         transcript=prepared_transcript,
                         call_type=call_type_ru,
                         manager_name=manager_name,
+                        call_direction_context=call_direction_context,
                     )
                 )
 
@@ -915,7 +923,8 @@ class AnalysisService:
                         {"role": "user", "content": ANALYSIS_USER_PROMPT.format(
                             transcript=prepared_transcript,
                             call_type=call_type_ru,
-                            manager_name=manager_name
+                            manager_name=manager_name,
+                            call_direction_context=call_direction_context,
                         )}
                     ],
                     temperature=ANALYSIS_TEMPERATURE,

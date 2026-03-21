@@ -288,7 +288,8 @@ async def process_call(
     call_created_at: Optional[int] = None,
     responsible_user_id: Optional[int] = None,
     phone: str = "",
-    entity_type: str = "leads"
+    entity_type: str = "leads",
+    call_direction: str = "call_in",
 ):
     """
     Основная функция обработки звонка.
@@ -364,7 +365,9 @@ async def process_call(
         
         # 3. Транскрибируем
         logger.info("🎙️ Транскрибация...")
-        transcription = await transcription_service.transcribe_audio(audio_data, speaker_labels=True)
+        transcription = await transcription_service.transcribe_audio(
+            audio_data, speaker_labels=True, call_direction=call_direction,
+        )
 
         if not (transcription.full_text or "").strip():
             logger.warning("⚠️ Пустая транскрибация (с диаризацией). Пробуем без диаризации...")
@@ -383,7 +386,7 @@ async def process_call(
         if not (transcription.full_text or "").strip():
             logger.warning("⚠️ Транскрибация пустая даже после retry — пропускаем обработку")
             return
-        
+
         # 4. Определяем роли
         if transcription.speakers:
             roles = transcription_service.identify_roles(transcription.speakers)
@@ -403,6 +406,7 @@ async def process_call(
             call_type=call_type_simple,
             manager_name=manager_name,
             speakers=transcription.speakers,
+            call_direction=call_direction,
         )
 
         # 5.5. Автозаполнение полей сделки
@@ -656,7 +660,8 @@ async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
             call_created_at=raw_created_at,
             responsible_user_id=responsible_user_id or note_data.get("responsible_user_id"),
             phone=phone,
-            entity_type=entity_type
+            entity_type=entity_type,
+            call_direction=actual_note_type,
         )
         
         return JSONResponse(content={"status": "processing", "note_id": note_id}, status_code=200)
@@ -732,6 +737,7 @@ async def process_uploaded_audio(
     phone: str,
     manager_name: str,
     call_created_at: Optional[int] = None,
+    call_direction: str = "call_in",
 ):
     """Обработка загруженного аудио (без скачивания)"""
     try:
@@ -740,7 +746,9 @@ async def process_uploaded_audio(
         # Используем общую логику обработки (без скачивания)
         # 1. Транскрибируем
         logger.info("🎙️ Транскрибация...")
-        transcription = await transcription_service.transcribe_audio(audio_data, speaker_labels=True)
+        transcription = await transcription_service.transcribe_audio(
+            audio_data, speaker_labels=True, call_direction=call_direction,
+        )
 
         if not (transcription.full_text or "").strip():
             logger.warning("⚠️ Пустая транскрибация (с диаризацией). Пробуем без диаризации...")
@@ -779,6 +787,7 @@ async def process_uploaded_audio(
             call_type=call_type_simple,
             manager_name=manager_name,
             speakers=transcription.speakers,
+            call_direction=call_direction,
         )
         
         # 4. Формируем примечание

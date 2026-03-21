@@ -56,6 +56,7 @@ class TranscriptionService:
         audio_data: bytes,
         language_code: str = "ru",
         speaker_labels: bool = True,
+        call_direction: str = "call_in",
     ) -> TranscriptionResult:
         """
         Главная точка входа. Определяет стерео/моно и выбирает стратегию.
@@ -77,7 +78,7 @@ class TranscriptionService:
             if channels >= 2 and speaker_labels:
                 # СТЕРЕО → идеальная диаризация через разделение каналов
                 logger.info("🎧 Стерео запись → разделяем каналы для диаризации")
-                return await self._transcribe_stereo(input_path, duration)
+                return await self._transcribe_stereo(input_path, duration, call_direction=call_direction)
             else:
                 # МОНО → обычная транскрибация Whisper
                 logger.info("🔈 Моно запись → транскрибация без диаризации")
@@ -92,7 +93,7 @@ class TranscriptionService:
     # Стерео: разделение каналов + Whisper на каждый
     # -------------------------------------------------------------------------
 
-    async def _transcribe_stereo(self, input_path: str, duration: float) -> TranscriptionResult:
+    async def _transcribe_stereo(self, input_path: str, duration: float, call_direction: str = "call_in") -> TranscriptionResult:
         """
         Разделяет стерео на 2 канала, транскрибирует каждый через Whisper,
         склеивает по таймстемпам.
@@ -133,6 +134,9 @@ class TranscriptionService:
 
             # 4. Склеиваем сегменты по таймстемпам
             speakers = self._merge_segments(left_segments, right_segments)
+
+            # 4.1 LLM-валидация и исправление атрибуции спикеров
+            speakers = await self._validate_and_fix_attribution(speakers, call_direction=call_direction)
 
             # 5. Формируем результат
             formatted_lines = []
@@ -290,6 +294,121 @@ class TranscriptionService:
         speakers = [s for s in speakers if len(s.text.strip()) > 2]
 
         return speakers
+
+    async def _validate_and_fix_attribution(
+        self,
+        speakers: List[Speaker],
+        call_direction: str = "call_in",
+    ) -> List[Speaker]:
+        """
+        LLM-пост-обработка: проверяет и исправляет атрибуцию спикеров по контексту.
+        Менеджер — тот, кто представляет компанию, называет цены, сроки, услуги.
+        Клиент — тот, кто описывает свою задачу, участок, спрашивает о стоимости.
+        """
+        if not speakers or len(speakers) < 4:
+            return speakers
+
+        # Формируем транскрипт для анализа
+        transcript_lines = []
+        for i, s in enumerate(speakers):
+            transcript_lines.append(f"{i}|{s.label}|{s.text}")
+
+        transcript_text = "\n".join(transcript_lines)
+
+        # Определяем контекст направления звонка
+        if call_direction == "call_out":
+            direction_context = """ВАЖНО: Это ИСХОДЯЩИЙ звонок (call_out). Менеджер НАБРАЛ номер клиента — значит:
+- Первая реплика обычно принадлежит КЛИЕНТУ — он снимает трубку и говорит "Алло?" / "Да?" / "Слушаю".
+- Менеджер обычно говорит ВТОРОЙ — представляется: "Здравствуйте, это компания...", "Добрый день, вас беспокоит...".
+- Ключевое: менеджер — тот, кто ИНИЦИАТОР разговора по делу, представляет компанию и предлагает услуги. Клиент — тот, кто ОТВЕЧАЕТ на звонок.
+- Если первая короткая реплика ("Алло", "Да", "Слушаю") помечена как "Менеджер" — скорее всего это ОШИБКА, это клиент снял трубку."""
+        else:
+            direction_context = """ВАЖНО: Это ВХОДЯЩИЙ звонок (call_in). Клиент НАБРАЛ номер компании — значит:
+- Первая реплика обычно принадлежит МЕНЕДЖЕРУ — он снимает трубку и говорит "Алло?" / "Компания Ставропольгеодезия, здравствуйте" / "Слушаю вас".
+- Клиент обычно говорит ВТОРОЙ — описывает зачем звонит: "Здравствуйте, мне нужно...", "Подскажите...", "Я хотел бы узнать...".
+- Ключевое: клиент — тот, кто ИНИЦИАТОР разговора по делу, описывает свою задачу. Менеджер — тот, кто ОТВЕЧАЕТ на звонок и консультирует.
+- Если первая реплика с приветствием от имени компании помечена как "Клиент" — скорее всего это ОШИБКА, это менеджер снял трубку."""
+
+        prompt = f"""Ты — система проверки атрибуции спикеров в расшифровке телефонного разговора.
+
+{direction_context}
+
+Дан транскрипт разговора между Менеджером и Клиентом. Каждая строка имеет формат: номер_строки|текущая_роль|текст
+
+Правила определения ролей:
+- МЕНЕДЖЕР: представляет компанию, называет цены и сроки работ, предлагает услуги, объясняет процесс, спрашивает кадастровый номер / адрес / контактные данные клиента, говорит фразы типа "мы сделаем", "стоимость составит", "можем начать", "пришлите номер участка"
+- КЛИЕНТ: описывает свою задачу / проблему / участок, спрашивает о стоимости, соглашается или отказывается, сообщает свои данные, говорит фразы типа "мне нужно", "у меня участок", "сколько стоит", "а можно ли"
+
+Проверь каждую строку. Если роль определена НЕПРАВИЛЬНО (например, клиент говорит фразу менеджера или наоборот), верни ТОЛЬКО номера строк которые нужно исправить, через запятую.
+
+Если все роли правильные — верни слово "OK".
+
+ВАЖНО:
+- Обычно ошибки идут блоками (несколько подряд неправильных строк), а не по одной.
+- Если в начале разговора роли определены правильно, а потом "переключились" — значит все строки после точки переключения неправильные.
+- Не исправляй строки если ты не уверен.
+
+Транскрипт:
+{transcript_text}
+
+Ответ (только номера строк через запятую, диапазоны через дефис, или "OK"):"""
+
+        try:
+            response = await self._openai_client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=500,
+            )
+
+            answer = response.choices[0].message.content.strip()
+            logger.info(f"🔍 LLM проверка атрибуции ({call_direction}): {answer}")
+
+            if answer.upper() == "OK":
+                logger.info("✅ Атрибуция спикеров корректна")
+                return speakers
+
+            # Парсим номера строк для исправления
+            try:
+                fix_indices = set()
+                for part in answer.replace(" ", "").split(","):
+                    part = part.strip()
+                    if part.isdigit():
+                        fix_indices.add(int(part))
+                    elif "-" in part:
+                        range_parts = part.split("-")
+                        if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
+                            start, end = int(range_parts[0]), int(range_parts[1])
+                            fix_indices.update(range(start, end + 1))
+
+                if not fix_indices:
+                    logger.warning(f"⚠️ Не удалось распарсить ответ LLM: {answer}")
+                    return speakers
+
+                # Исправляем роли
+                fixed_count = 0
+                for i in fix_indices:
+                    if 0 <= i < len(speakers):
+                        old_label = speakers[i].label
+                        new_label = "Клиент" if old_label == "Менеджер" else "Менеджер"
+                        speakers[i] = Speaker(
+                            label=new_label,
+                            text=speakers[i].text,
+                            start_ms=speakers[i].start_ms,
+                            end_ms=speakers[i].end_ms,
+                        )
+                        fixed_count += 1
+
+                logger.info(f"🔧 Исправлена атрибуция у {fixed_count} реплик из {len(speakers)}")
+                return speakers
+
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка парсинга ответа LLM ({answer}): {e}")
+                return speakers
+
+        except Exception as e:
+            logger.error(f"❌ LLM валидация атрибуции не удалась: {e}")
+            return speakers
 
     # -------------------------------------------------------------------------
     # Моно: обычная транскрибация Whisper (без диаризации)
