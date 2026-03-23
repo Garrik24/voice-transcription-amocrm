@@ -539,8 +539,8 @@ async def process_call(
             formatted_transcript = transcription.full_text or ""
         logger.info(f"📝 Транскрибация: {len(formatted_transcript)} символов")
         
-        # 5. Анализируем через GPT
-        logger.info("🤖 Анализ через GPT...")
+        # 5. Анализируем через Claude
+        logger.info("🤖 Анализ через Claude...")
         call_type_simple = "outgoing" if "outgoing" in call_type else "incoming"
         analysis = await analysis_service.analyze_call(
             formatted_transcript,
@@ -953,8 +953,8 @@ async def process_uploaded_audio(
             formatted_transcript = transcription.full_text or ""
         logger.info(f"📝 Транскрибация: {len(formatted_transcript)} символов")
         
-        # 3. Анализируем через GPT
-        logger.info("🤖 Анализ через GPT...")
+        # 3. Анализируем через Claude
+        logger.info("🤖 Анализ через Claude...")
         call_type_simple = "outgoing" if "outgoing" in call_type else "incoming"
         analysis = await analysis_service.analyze_call(
             formatted_transcript,

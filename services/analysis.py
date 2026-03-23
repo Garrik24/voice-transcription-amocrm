@@ -1,21 +1,19 @@
 """
-Сервис анализа разговора через OpenAI GPT.
-Извлекает структурированную информацию из транскрибации.
+Сервис анализа разговора через Claude Sonnet 4.6 (Anthropic API).
+Замена GPT-4.1-mini / Gemini → Claude Sonnet 4.6.
+Интерфейс (CallAnalysis, AnalysisService, format_note) сохранён для совместимости с main.py.
 """
-import openai
+import anthropic
 import json
 import logging
 import re
+import os
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 from config import (
-    GEMINI_API_KEY,
-    GEMINI_MODEL,
-    LLM_PROVIDER,
-    OPENAI_API_KEY,
-    OPENAI_MODEL,
+    ANTHROPIC_API_KEY,
+    ANTHROPIC_MODEL,
     OPENAI_MAX_TOKENS,
-    GEMINI_MAX_OUTPUT_TOKENS,
     ANALYSIS_TEMPERATURE,
     ANALYSIS_PIPELINE_VERSION,
     MAX_TRANSCRIPT_LENGTH,
@@ -24,8 +22,7 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-_client: openai.AsyncOpenAI | None = None
-_gemini_client = None
+_anthropic_client: anthropic.AsyncAnthropic | None = None
 
 
 def _normalize_list_field(value) -> List[str]:
@@ -55,38 +52,18 @@ def _normalize_list_field(value) -> List[str]:
     return [s] if s else []
 
 
-def _get_client() -> openai.AsyncOpenAI:
+def _get_anthropic_client() -> anthropic.AsyncAnthropic:
     """
-    Инициализируем OpenAI клиент лениво.
-
-    Важно для деплоя: если OPENAI_API_KEY не задан, сервис всё равно должен стартовать
-    (например, для автоматизаций без транскрибации).
+    Инициализируем Anthropic клиент лениво.
     """
-    global _client
-    if _client is not None:
-        return _client
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY не задан (нужен для анализа звонков)")
-    _client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-    return _client
-
-
-def _get_gemini_client():
-    """
-    Инициализируем Google GenAI (Gemini) клиент лениво.
-
-    Важно: ключи не валим на старте приложения — только при попытке анализа.
-    """
-    global _gemini_client
-    if _gemini_client is not None:
-        return _gemini_client
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY не задан (нужен для анализа звонков через Gemini)")
-    # Импортируем внутри, чтобы не падать, если провайдер не используется.
-    from google import genai
-
-    _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _gemini_client
+    global _anthropic_client
+    if _anthropic_client is not None:
+        return _anthropic_client
+    api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY не задан (нужен для анализа звонков)")
+    _anthropic_client = anthropic.AsyncAnthropic(api_key=api_key)
+    return _anthropic_client
 
 
 @dataclass
@@ -247,47 +224,7 @@ location:
   "call_result": "string",
   "next_contact_date": "string",
   "next_steps": ["string"]
-}}}}
-
-7. Пример
-
-Транскрибация:
-Менеджер (Игорь): Алло, добрый день!
-Клиент (Давид): Здравствуйте, меня зовут Давид. Мне нужно вынести границы участка.
-Менеджер: Да, подскажите, где участок находится?
-Клиент: Это возле Старомарьского шоссе, рядом с автосалоном Хрополь, ну там недалеко от четырёх сезонов.
-Менеджер: Понял. А площадь участка какая?
-Клиент: 80 соток, участок ровный.
-Менеджер: Хорошо. Вынос точек по GPS стоит 4000 рублей. Но я должен вас предупредить — в том районе GPS может глушиться. Если сигнал не ловится, нужен будет геодезический ход, это от 25 тысяч.
-Клиент: Понял. Давайте сначала попробуем по GPS.
-Менеджер: Договорились. Скиньте мне кадастровый номер участка в телеграм, я закажу расширенную выписку, посмотрю сколько точек, и скажу вам точную цену.
-Клиент: Хорошо, скину. Только я смогу начать не раньше чем через неделю.
-Клиент: А, да, мне Алексей ваш порекомендовал к вам обратиться.
-Менеджер: Отлично, спасибо. Жду данные, до свидания!
-
-Правильный ответ:
-{{{{
-  "client_name": "Давид",
-  "manager_name": "Игорь",
-  "summary": "Клиент Давид — вынос границ участка (~80 соток, ровная форма), район Старомарьского шоссе, рядом с автосалоном Хрополь / «Четыре сезона». GPS в этом районе глушится — вынос по GPS 4 000 ₽, если не ловит — геодезический ход от 25 000 ₽. Порекомендовал обратиться Алексей из компании. Договорились: Давид скинет кадастровый номер в Telegram, после чего будет определена точная цена и дата выезда.",
-  "client_city": "Не указано",
-  "work_type": "Вынос границ",
-  "location": "Старомарьское шоссе",
-  "cost": "4 000 ₽ за вынос по GPS, от 25 000 ₽ за геодезический ход",
-  "payment_terms": "Не обсуждали",
-  "call_result": "Согласие",
-  "next_contact_date": "Через неделю",
-  "next_steps": [
-    "Получить от клиента кадастровый номер участка в Telegram",
-    "Менеджеру: заказать расширенную выписку, определить кол-во точек и точную стоимость",
-    "Менеджеру: сообщить клиенту цену и согласовать дату выезда"
-  ]
-}}}}
-
-Пример ПЛОХОГО summary (так делать НЕЛЬЗЯ):
-"summary": "Клиент Давид позвонил менеджеру Игорю по поводу выноса точки на участке, который находится возле Старомарьского шоссе, рядом с автосалоном Хрополь. Менеджер объяснил, что вынос по GPS стоит 4000 рублей, но если сигнал не ловится, потребуется геодезический ход, что обойдётся от 25 тысяч рублей. Клиент согласился сначала попробовать вынос по GPS. Менеджер попросил кадастровый номер участка. Клиент согласился отправить данные через Telegram."
-Почему плохо: это хронологический пересказ, дублирует поля cost и next_steps, содержит вводную «позвонил менеджеру».
-"""
+}}}}"""
 
 
 ANALYSIS_USER_PROMPT = """Проанализируй разговор между менеджером и клиентом.
@@ -299,8 +236,7 @@ ANALYSIS_USER_PROMPT = """Проанализируй разговор между
 ПОМНИ: {manager_name} = МЕНЕДЖЕР (не клиент!)
 
 ТРАНСКРИБАЦИЯ РАЗГОВОРА:
-{transcript}
-"""
+{transcript}"""
 
 
 # Системный промпт для валидатора (Агент 2)
@@ -334,8 +270,7 @@ VALIDATOR_SYSTEM_PROMPT = """Ты — валидатор результатов 
   "next_contact_date": "найденное значение или 'Не указано'"
 }
 
-Отвечай ТОЛЬКО JSON, без пояснений.
-"""
+Отвечай ТОЛЬКО JSON, без пояснений."""
 
 
 VALIDATOR_USER_PROMPT = """Первый анализ пропустил обязательную информацию.
@@ -345,8 +280,7 @@ VALIDATOR_USER_PROMPT = """Первый анализ пропустил обяз
 ТРАНСКРИБАЦИЯ РАЗГОВОРА:
 {transcript}
 
-Найди пропущенную информацию для этих полей. Если действительно нет — верни "Не указано".
-"""
+Найди пропущенную информацию для этих полей. Если действительно нет — верни "Не указано"."""
 
 
 VERIFY_FIELDS = [
@@ -425,12 +359,44 @@ FACT_VERIFIER_USER_PROMPT = """Проверь анализ на соответс
     "next_contact_date": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":"Не указано","evidence":["..."]}},
     "next_steps": {{"status":"supported|unsure|contradicted","confidence":0.0,"suggested_fix":[],"evidence":["..."]}}
   }}
-}}
-"""
+}}"""
+
+
+def _extract_json_from_text(text: str) -> dict:
+    """
+    Извлекает JSON из ответа Claude.
+    Claude может обернуть JSON в ```json ... ``` или вернуть чистый JSON.
+    """
+    text = text.strip()
+
+    # Попробуем распарсить как чистый JSON
+    if text.startswith("{"):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+    # Извлечь из markdown блока ```json ... ```
+    json_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    if json_match:
+        try:
+            return json.loads(json_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # Извлечь первый { ... } блок
+    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace_match:
+        try:
+            return json.loads(brace_match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    raise json.JSONDecodeError("Не удалось извлечь JSON из ответа Claude", text, 0)
 
 
 class AnalysisService:
-    """Сервис анализа разговоров через GPT/Gemini с валидацией"""
+    """Сервис анализа разговоров через Claude Sonnet 4.6 с валидацией"""
 
     @staticmethod
     def _clamp_confidence(value: Any) -> float:
@@ -550,41 +516,51 @@ class AnalysisService:
             )
         return result
 
-    async def _verify_with_gemini(
+    async def _call_claude(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 2500,
+        temperature: float = 0.1,
+    ) -> str:
+        """
+        Универсальный вызов Claude API.
+        Возвращает текст ответа.
+        """
+        client = _get_anthropic_client()
+        model = ANTHROPIC_MODEL
+
+        response = await client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+
+        result_text = response.content[0].text
+
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        cost_estimate = (input_tokens / 1_000_000 * 3.0) + (output_tokens / 1_000_000 * 15.0)
+        logger.info(
+            f"Claude call done: {input_tokens} in / {output_tokens} out, "
+            f"~${cost_estimate:.4f}, model={model}"
+        )
+
+        return result_text
+
+    async def _verify_with_claude(
         self,
         analysis: CallAnalysis,
         transcript: str,
         speaker_stats: SpeakerStats,
     ) -> Dict[str, FieldVerification]:
+        """Fact verifier (Агент 3) через Claude."""
         try:
             prepared_transcript = self._prepare_transcript(transcript)
-            gemini = _get_gemini_client()
-            from google.genai import types
 
-            schema = {
-                "type": "OBJECT",
-                "required": ["fields"],
-                "properties": {
-                    "fields": {
-                        "type": "OBJECT",
-                        "properties": {
-                            name: {
-                                "type": "OBJECT",
-                                "required": ["status", "confidence", "suggested_fix", "evidence"],
-                                "properties": {
-                                    "status": {"type": "STRING"},
-                                    "confidence": {"type": "NUMBER"},
-                                    "suggested_fix": {"type": "STRING"} if name != "next_steps" else {"type": "ARRAY", "items": {"type": "STRING"}},
-                                    "evidence": {"type": "ARRAY", "items": {"type": "STRING"}},
-                                },
-                            }
-                            for name in VERIFY_FIELDS
-                        },
-                    }
-                },
-            }
-
-            prompt = FACT_VERIFIER_USER_PROMPT.format(
+            user_prompt = FACT_VERIFIER_USER_PROMPT.format(
                 analysis_json=json.dumps(self._analysis_to_dict(analysis), ensure_ascii=False),
                 speaker_stats_json=json.dumps(
                     {
@@ -598,66 +574,16 @@ class AnalysisService:
                 transcript=prepared_transcript,
             )
 
-            response = await gemini.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=f"{FACT_VERIFIER_SYSTEM_PROMPT}\n\n{prompt}",
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=1200,
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                ),
-            )
-            parsed = json.loads(response.text or "{}")
-            return self._normalize_verification_result(parsed)
-        except Exception as e:
-            logger.error(f"Ошибка fact verifier через Gemini: {e}")
-            return {
-                field: FieldVerification(
-                    field=field,
-                    status="unsure",
-                    confidence=0.0,
-                    suggested_fix=FIELD_DEFAULTS[field],
-                    evidence=[],
-                )
-                for field in VERIFY_FIELDS
-            }
-
-    async def _verify_with_openai(
-        self,
-        analysis: CallAnalysis,
-        transcript: str,
-        speaker_stats: SpeakerStats,
-    ) -> Dict[str, FieldVerification]:
-        try:
-            prepared_transcript = self._prepare_transcript(transcript)
-            client = _get_client()
-            response = await client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": FACT_VERIFIER_SYSTEM_PROMPT},
-                    {"role": "user", "content": FACT_VERIFIER_USER_PROMPT.format(
-                        analysis_json=json.dumps(self._analysis_to_dict(analysis), ensure_ascii=False),
-                        speaker_stats_json=json.dumps(
-                            {
-                                "participant_count": speaker_stats.participant_count,
-                                "total_speech_seconds": speaker_stats.total_speech_seconds,
-                                "dominant_speaker": speaker_stats.dominant_speaker,
-                                "suspicious_diarization": speaker_stats.suspicious_diarization,
-                            },
-                            ensure_ascii=False,
-                        ),
-                        transcript=prepared_transcript,
-                    )},
-                ],
-                temperature=0.0,
+            result_text = await self._call_claude(
+                system_prompt=FACT_VERIFIER_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
                 max_tokens=1200,
-                response_format={"type": "json_object"},
+                temperature=0.0,
             )
-            parsed = json.loads(response.choices[0].message.content or "{}")
+            parsed = _extract_json_from_text(result_text)
             return self._normalize_verification_result(parsed)
         except Exception as e:
-            logger.error(f"Ошибка fact verifier через OpenAI: {e}")
+            logger.error(f"Ошибка fact verifier через Claude: {e}")
             return {
                 field: FieldVerification(
                     field=field,
@@ -693,86 +619,30 @@ class AnalysisService:
             setattr(analysis, field, str(fallback))
         return analysis
 
-    async def _validate_with_gemini(
+    async def _validate_with_claude(
         self,
         transcript: str,
         missing_fields: List[str]
     ) -> dict:
-        """Валидация через Gemini (Агент 2)"""
+        """Валидация через Claude (Агент 2)"""
         try:
             prepared_transcript = self._prepare_transcript(transcript)
-            gemini = _get_gemini_client()
-            from google.genai import types
-            
-            # Схема ответа для валидатора
-            response_schema = {
-                "type": "OBJECT",
-                "required": ["client_city", "cost", "payment_terms", "next_contact_date"],
-                "properties": {
-                    "client_city": {"type": "STRING"},
-                    "cost": {"type": "STRING"},
-                    "payment_terms": {"type": "STRING"},
-                    "next_contact_date": {"type": "STRING"},
-                },
-            }
-            
-            prompt = (
-                f"{VALIDATOR_SYSTEM_PROMPT}\n\n"
-                + VALIDATOR_USER_PROMPT.format(
+
+            result_text = await self._call_claude(
+                system_prompt=VALIDATOR_SYSTEM_PROMPT,
+                user_prompt=VALIDATOR_USER_PROMPT.format(
                     missing_fields=", ".join(missing_fields),
-                    transcript=prepared_transcript
-                )
-            )
-            
-            response = await gemini.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=800,  # Валидатору нужно меньше
-                    response_mime_type="application/json",
-                    response_schema=response_schema,
+                    transcript=prepared_transcript,
                 ),
-            )
-            
-            result_text = response.text or "{}"
-            return json.loads(result_text)
-            
-        except Exception as e:
-            logger.error(f"Ошибка валидации через Gemini: {e}")
-            return {}
-    
-    async def _validate_with_openai(
-        self,
-        transcript: str,
-        missing_fields: List[str]
-    ) -> dict:
-        """Валидация через OpenAI (Агент 2)"""
-        try:
-            prepared_transcript = self._prepare_transcript(transcript)
-            client = _get_client()
-            
-            response = await client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": VALIDATOR_SYSTEM_PROMPT},
-                    {"role": "user", "content": VALIDATOR_USER_PROMPT.format(
-                        missing_fields=", ".join(missing_fields),
-                        transcript=prepared_transcript
-                    )}
-                ],
-                temperature=0.1,
                 max_tokens=800,
-                response_format={"type": "json_object"}
+                temperature=0.1,
             )
-            
-            result_text = response.choices[0].message.content
-            return json.loads(result_text)
-            
+            return _extract_json_from_text(result_text)
+
         except Exception as e:
-            logger.error(f"Ошибка валидации через OpenAI: {e}")
+            logger.error(f"Ошибка валидации через Claude: {e}")
             return {}
-    
+
     async def _validate_and_fix(
         self,
         analysis: CallAnalysis,
@@ -790,27 +660,22 @@ class AnalysisService:
             "payment_terms": analysis.payment_terms,
             "next_contact_date": analysis.next_contact_date
         }
-        
+
         missing = [
             field for field, value in required_fields.items()
             if value in ["Не указано", "Не обсуждали", "Консультация", ""]
         ]
-        
+
         if not missing:
             logger.info("✅ Все обязательные поля заполнены, валидация не требуется")
             return analysis
-        
+
         # Запускаем валидатор (Агент 2)
         logger.warning(f"⚠️ Пропущены обязательные поля: {missing}")
         logger.info("🔍 Запускаем валидатор (Агент 2) для поиска пропущенной информации...")
-        
-        provider = (LLM_PROVIDER or "openai").strip().lower()
-        
-        if provider == "gemini":
-            fixed_data = await self._validate_with_gemini(transcript, missing)
-        else:
-            fixed_data = await self._validate_with_openai(transcript, missing)
-        
+
+        fixed_data = await self._validate_with_claude(transcript, missing)
+
         # Обновляем анализ найденными значениями
         updated_count = 0
         for field in missing:
@@ -820,46 +685,43 @@ class AnalysisService:
                 setattr(analysis, field, new_value)
                 logger.info(f"✅ Валидатор нашёл {field}: '{old_value}' → '{new_value}'")
                 updated_count += 1
-        
+
         if updated_count > 0:
             logger.info(f"🎉 Валидатор исправил {updated_count} из {len(missing)} полей")
         else:
             logger.warning("⚠️ Валидатор не смог найти дополнительную информацию")
-        
+
         return analysis
-    
+
     def _prepare_transcript(self, transcript: str) -> str:
         """
         Подготавливает транскрипцию для анализа.
         По умолчанию НЕ обрезаем: для звонков до ~30 минут хотим анализировать весь текст.
-        Если TRUNCATE_TRANSCRIPT_FOR_ANALYSIS=true и транскрипция слишком длинная —
-        берём начало и конец (где обычно ключевая информация) для экономии токенов.
         """
         if not TRUNCATE_TRANSCRIPT_FOR_ANALYSIS:
             return transcript
 
         if len(transcript) <= MAX_TRANSCRIPT_LENGTH:
             return transcript
-        
+
         logger.info(f"Транскрипция длинная ({len(transcript)} символов), обрезаем до {MAX_TRANSCRIPT_LENGTH}")
-        
+
         # Берём начало (первые 60%) и конец (последние 40%)
-        # Это сохраняет представление в начале и финальные договорённости в конце
         start_length = int(MAX_TRANSCRIPT_LENGTH * 0.6)
         end_length = MAX_TRANSCRIPT_LENGTH - start_length
-        
+
         start_part = transcript[:start_length]
         end_part = transcript[-end_length:]
-        
+
         prepared = f"""{start_part}
 
 [... пропущена средняя часть разговора для экономии токенов ...]
 
 {end_part}"""
-        
+
         logger.info(f"Обрезанная транскрипция: {len(prepared)} символов")
         return prepared
-    
+
     async def analyze_call(
         self,
         transcript: str,
@@ -870,16 +732,17 @@ class AnalysisService:
     ) -> CallAnalysis:
         """
         Анализирует транскрибацию звонка и извлекает структурированные данные.
+        Использует Claude Sonnet 4.6 (Anthropic API).
         """
         try:
             logger.info(f"Анализируем разговор ({len(transcript)} символов)...")
-            
+
             # Подготавливаем транскрипцию (обрезаем если слишком длинная)
             prepared_transcript = self._prepare_transcript(transcript)
-            
+
             # Определяем длину звонка для адаптации параметров
             is_long_call = len(transcript) > 8000  # примерно 5+ минут
-            
+
             call_type_ru = "Входящий" if call_type == "incoming" else "Исходящий"
 
             if call_direction == "call_out":
@@ -887,145 +750,68 @@ class AnalysisService:
             else:
                 call_direction_context = "Это ВХОДЯЩИЙ звонок — клиент позвонил в компанию."
 
-            provider = (LLM_PROVIDER or "openai").strip().lower()
-            model_name = GEMINI_MODEL if provider == "gemini" else OPENAI_MODEL
-            logger.info(f"🤖 Анализ через {provider}/{model_name}")
+            logger.info(f"🤖 Анализ через anthropic/{ANTHROPIC_MODEL}")
 
             # Адаптируем max_tokens в зависимости от длины звонка
             if is_long_call:
                 max_tokens = OPENAI_MAX_TOKENS
-                max_output_tokens = GEMINI_MAX_OUTPUT_TOKENS
                 logger.info(f"Длинный звонок, используем увеличенные лимиты: {max_tokens} токенов")
             else:
                 max_tokens = min(OPENAI_MAX_TOKENS, 1500)
-                max_output_tokens = min(GEMINI_MAX_OUTPUT_TOKENS, 2000)
                 logger.info(f"Короткий звонок, используем стандартные лимиты: {max_tokens} токенов")
 
-            if provider == "gemini":
-                gemini = _get_gemini_client()
-                from google.genai import types
+            system_prompt = ANALYSIS_SYSTEM_PROMPT.format(manager_name=manager_name)
+            user_prompt = ANALYSIS_USER_PROMPT.format(
+                transcript=prepared_transcript,
+                call_type=call_type_ru,
+                manager_name=manager_name,
+                call_direction_context=call_direction_context,
+            )
 
-                # Схема ответа: строго JSON-объект с ожидаемыми полями.
-                response_schema = {
-                    "type": "OBJECT",
-                    "required": [
-                        "client_name",
-                        "manager_name",
-                        "summary",
-                        "client_city",
-                        "work_type",
-                        "cost",
-                        "payment_terms",
-                        "call_result",
-                        "next_contact_date",
-                        "next_steps",
-                    ],
-                    "properties": {
-                        "client_name": {"type": "STRING"},
-                        "manager_name": {"type": "STRING"},
-                        "summary": {"type": "STRING"},
-                        "client_city": {"type": "STRING"},
-                        "work_type": {"type": "STRING"},
-                        "cost": {"type": "STRING"},
-                        "payment_terms": {"type": "STRING"},
-                        "call_result": {"type": "STRING"},
-                        "next_contact_date": {"type": "STRING"},
-                        "next_steps": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    },
-                }
+            # Retry логика (2 попытки)
+            max_retries = 2
+            last_error = None
+            result_json = None
 
-                prompt = (
-                    ANALYSIS_SYSTEM_PROMPT.format(manager_name=manager_name) + "\n\n"
-                    + ANALYSIS_USER_PROMPT.format(
-                        transcript=prepared_transcript,
-                        call_type=call_type_ru,
-                        manager_name=manager_name,
-                        call_direction_context=call_direction_context,
+            for attempt in range(max_retries):
+                try:
+                    result_text = await self._call_claude(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        max_tokens=max_tokens,
+                        temperature=ANALYSIS_TEMPERATURE,
                     )
-                )
 
-                # Retry логика для Gemini (2 попытки)
-                max_retries = 2
-                last_error = None
-                result_json = None
-                
-                for attempt in range(max_retries):
-                    try:
-                        response = await gemini.aio.models.generate_content(
-                            model=GEMINI_MODEL,
-                            contents=prompt,
-                            config=types.GenerateContentConfig(
-                                temperature=ANALYSIS_TEMPERATURE,
-                                max_output_tokens=max_output_tokens,
-                                response_mime_type="application/json",
-                                response_schema=response_schema,
-                            ),
-                        )
+                    logger.info(
+                        f"🔬 Claude raw first 100 chars: {repr(result_text[:100]) if result_text else 'EMPTY'}"
+                    )
 
-                        result_text = response.text or ""
-                        
-                        # #region agent log - DEBUG: capture raw Gemini response
-                        logger.info(f"🔬 [H1] Gemini raw first 100 chars: {repr(result_text[:100]) if result_text else 'EMPTY'}")
-                        logger.info(f"🔬 [H2] starts_with_brace={result_text.startswith('{') if result_text else False}, len={len(result_text) if result_text else 0}")
-                        logger.info(f"🔬 [H3] has_markdown={'```' in result_text if result_text else False}")
-                        if result_text and len(result_text) > 100:
-                            logger.info(f"🔬 [H5] last 100 chars: {repr(result_text[-100:])}")
-                        # #endregion
-                        
-                        if not result_text.strip():
-                            raise ValueError("Пустой ответ от Gemini")
-                        
-                        result_json = json.loads(result_text)
-                        if attempt > 0:
-                            logger.info(f"✅ Gemini успешно ответил с попытки {attempt + 1}")
-                        break  # Успех — выходим из цикла
-                        
-                    except (json.JSONDecodeError, ValueError) as e:
-                        last_error = e
-                        # #region agent log - DEBUG: capture parse error
-                        logger.error(f"🔬 [ERROR] JSON parse failed: {type(e).__name__}: {e}")
-                        logger.error(f"🔬 [ERROR] Full raw response: {repr(result_text[:500]) if result_text else 'NO_RESPONSE'}")
-                        # #endregion
-                        logger.warning(f"⚠️ Gemini попытка {attempt + 1}/{max_retries}: {e}")
-                        if hasattr(response, 'text') and response.text:
-                            logger.warning(f"Сырой ответ ({len(response.text)} символов): {response.text[:500]}...")
-                        
-                        if attempt < max_retries - 1:
-                            logger.info("🔄 Повторяем запрос к Gemini...")
-                            import asyncio
-                            await asyncio.sleep(1)  # Небольшая пауза перед retry
-                        else:
-                            logger.error(f"❌ Gemini не вернул валидный JSON после {max_retries} попыток")
-                            raise
-                
-                if result_json is None:
-                    raise last_error or ValueError("Не удалось получить ответ от Gemini")
+                    if not result_text.strip():
+                        raise ValueError("Пустой ответ от Claude")
 
-            else:
-                client = _get_client()
-                response = await client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[
-                        {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT.format(manager_name=manager_name)},
-                        {"role": "user", "content": ANALYSIS_USER_PROMPT.format(
-                            transcript=prepared_transcript,
-                            call_type=call_type_ru,
-                            manager_name=manager_name,
-                            call_direction_context=call_direction_context,
-                        )}
-                    ],
-                    temperature=ANALYSIS_TEMPERATURE,
-                    max_tokens=max_tokens,
-                    response_format={"type": "json_object"}
-                )
+                    result_json = _extract_json_from_text(result_text)
+                    if attempt > 0:
+                        logger.info(f"✅ Claude успешно ответил с попытки {attempt + 1}")
+                    break
 
-                result_text = response.choices[0].message.content
-                result_json = json.loads(result_text)
+                except (json.JSONDecodeError, ValueError) as e:
+                    last_error = e
+                    logger.warning(f"⚠️ Claude попытка {attempt + 1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        logger.info("🔄 Повторяем запрос к Claude...")
+                        import asyncio
+                        await asyncio.sleep(1)
+                    else:
+                        logger.error(f"❌ Claude не вернул валидный JSON после {max_retries} попыток")
+                        raise
+
+            if result_json is None:
+                raise last_error or ValueError("Не удалось получить ответ от Claude")
 
             next_steps = result_json.get("next_steps") or []
             if not isinstance(next_steps, list):
                 next_steps = []
-            
+
             # Создаём объект результата (Агент 1)
             analysis = CallAnalysis(
                 client_name=result_json.get("client_name", "Клиент"),
@@ -1040,9 +826,9 @@ class AnalysisService:
                 next_contact_date=result_json.get("next_contact_date", "Не указано"),
                 next_steps=[str(x).strip() for x in next_steps if str(x).strip()][:5],
             )
-            
-            logger.info("✅ Агент 1 (анализ) завершил работу")
-            
+
+            logger.info("✅ Агент 1 (анализ через Claude) завершил работу")
+
             # Запускаем валидатор (Агент 2)
             validated_analysis = await self._validate_and_fix(
                 analysis,
@@ -1050,7 +836,7 @@ class AnalysisService:
                 manager_name
             )
 
-            logger.info("✅ Агент 2 (валидация) завершил работу")
+            logger.info("✅ Агент 2 (валидация через Claude) завершил работу")
 
             # v2: детерминированные метрики спикеров + верификация фактов.
             speaker_stats = self._build_speaker_stats(speakers)
@@ -1066,25 +852,24 @@ class AnalysisService:
 
             if ANALYSIS_PIPELINE_VERSION == "v2":
                 logger.info("🚀 ANALYSIS_PIPELINE_VERSION=v2, запускаем fact verifier (Агент 3)")
-                provider = (LLM_PROVIDER or "openai").strip().lower()
-                if provider == "gemini":
-                    checks = await self._verify_with_gemini(validated_analysis, transcript, speaker_stats)
-                else:
-                    checks = await self._verify_with_openai(validated_analysis, transcript, speaker_stats)
+                checks = await self._verify_with_claude(validated_analysis, transcript, speaker_stats)
                 validated_analysis = self._apply_verification(validated_analysis, checks)
-                logger.info("✅ Агент 3 (fact verifier) завершил работу")
+                logger.info("✅ Агент 3 (fact verifier через Claude) завершил работу")
             else:
                 logger.info("ℹ️ ANALYSIS_PIPELINE_VERSION=v1, fact verifier отключен")
 
             return validated_analysis
-            
+
         except json.JSONDecodeError as e:
-            logger.error(f"Ошибка парсинга JSON от GPT: {e}")
+            logger.error(f"Ошибка парсинга JSON от Claude: {e}")
+            raise
+        except anthropic.APIError as e:
+            logger.error(f"Anthropic API error: {e.status_code} - {e.message}")
             raise
         except Exception as e:
             logger.error(f"Ошибка анализа: {e}")
             raise
-    
+
     def format_note(
         self,
         analysis: CallAnalysis,
@@ -1096,16 +881,13 @@ class AnalysisService:
     ) -> str:
         """
         Форматирует результат анализа в примечание для AmoCRM.
-        model_used: например "openai/gpt-4o-mini" или "gemini/gemini-2.0-flash-001"
-        stt_provider: например "whisper", "assemblyai", "yandex"
         """
         minutes = int(duration_seconds // 60)
         seconds = int(duration_seconds % 60)
         duration_str = f"{minutes} мин {seconds} сек" if minutes else f"{seconds} сек"
         call_type_str = "Исходящий" if call_type == "outgoing" else "Входящий"
 
-        provider = (LLM_PROVIDER or "openai").strip().lower()
-        model_name = model_used or (f"{provider}/{GEMINI_MODEL}" if provider == "gemini" else f"{provider}/{OPENAI_MODEL}")
+        model_name = model_used or f"anthropic/{ANTHROPIC_MODEL}"
 
         stt_label = (stt_provider or "assemblyai").strip().lower()
         stt_display = {"whisper": "Whisper", "assemblyai": "AssemblyAI", "yandex": "Yandex"}.get(stt_label, stt_label)

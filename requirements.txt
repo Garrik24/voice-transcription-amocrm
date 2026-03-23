@@ -10,6 +10,7 @@ httpx>=0.28.1,<1
 assemblyai>=0.52.0,<1
 openai>=1.40.0,<2
 google-genai==1.33.0
+anthropic>=0.45.0
 
 # Environment
 python-dotenv==1.0.1

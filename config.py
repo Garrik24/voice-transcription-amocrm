@@ -36,9 +36,13 @@ ASSEMBLYAI_MULTICHANNEL = os.getenv("ASSEMBLYAI_MULTICHANNEL", "true").strip().l
 # ============== OpenAI ==============
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ============== LLM provider switch (OpenAI / Gemini) ==============
-# openai | gemini
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+# ============== Anthropic (Claude) ==============
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+# ============== LLM provider switch (openai / gemini / anthropic) ==============
+# openai | gemini | anthropic
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
 
 # Модели (можно переопределить в Railway Variables)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
