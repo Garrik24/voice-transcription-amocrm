@@ -253,6 +253,103 @@ PROCESSED_CALLS = set()
 PROCESSED_LOCK = asyncio.Lock()
 
 
+async def _get_audio_duration(audio_data: bytes) -> float:
+    """Определяет длительность аудио через ffprobe."""
+    import tempfile
+    import os
+    suffix = ".mp3"
+    if audio_data[:4] == b'RIFF':
+        suffix = ".wav"
+    elif audio_data[:4] == b'OggS':
+        suffix = ".ogg"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(audio_data)
+        tmp_path = f.name
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            tmp_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        return float(stdout.decode().strip())
+    except Exception:
+        return 0.0
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+async def _ensure_full_recording(
+    audio_data: bytes,
+    record_url: str,
+    expected_duration: int,
+    max_retries: int = 4,
+) -> bytes:
+    """
+    Проверяет, что скачанная запись соответствует ожидаемой длительности.
+    Если аудио слишком короткое (< 50% от ожидаемого) — ждёт и скачивает заново.
+    Это решает проблему, когда vmclouds ещё не успел обработать полную запись.
+    """
+    actual_duration = await _get_audio_duration(audio_data)
+    threshold = expected_duration * 0.5
+
+    if actual_duration >= threshold:
+        logger.info(
+            f"✅ Длительность аудио OK: {actual_duration:.0f}с "
+            f"(ожидалось {expected_duration}с)"
+        )
+        return audio_data
+
+    logger.warning(
+        f"⚠️ Аудио слишком короткое: {actual_duration:.0f}с из ожидаемых {expected_duration}с. "
+        f"Запись ещё не готова на vmclouds — ждём и повторяем скачивание..."
+    )
+
+    # Задержки: 30с, 60с, 90с, 120с
+    retry_delays = [30, 60, 90, 120]
+    best_data = audio_data
+    best_duration = actual_duration
+
+    for attempt in range(max_retries):
+        delay = retry_delays[min(attempt, len(retry_delays) - 1)]
+        logger.info(
+            f"⏳ Попытка {attempt + 1}/{max_retries}: ждём {delay}с..."
+        )
+        await asyncio.sleep(delay)
+
+        try:
+            new_data = await amocrm_service.download_call_recording(record_url)
+            new_duration = await _get_audio_duration(new_data)
+            logger.info(
+                f"📊 Попытка {attempt + 1}: скачано {len(new_data)} байт, "
+                f"длительность {new_duration:.0f}с (ожидаем {expected_duration}с)"
+            )
+
+            if new_duration > best_duration:
+                best_data = new_data
+                best_duration = new_duration
+
+            if new_duration >= threshold:
+                logger.info(
+                    f"✅ Запись готова! {new_duration:.0f}с "
+                    f"(ожидалось {expected_duration}с)"
+                )
+                return best_data
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка при повторном скачивании: {e}")
+
+    logger.warning(
+        f"⚠️ Запись так и не стала полной после {max_retries} попыток. "
+        f"Лучший результат: {best_duration:.0f}с из {expected_duration}с. "
+        f"Используем что есть."
+    )
+    return best_data
+
+
 async def is_already_processed(record_url: str) -> bool:
     """Проверяет, обрабатывался ли уже этот звонок по URL записи"""
     async with PROCESSED_LOCK:
@@ -311,6 +408,13 @@ app = FastAPI(
 )
 
 
+async def _delayed_process_call(delay: int = 0, **kwargs):
+    """Обёртка: ждёт delay секунд, затем вызывает process_call."""
+    if delay > 0:
+        await asyncio.sleep(delay)
+    await process_call(**kwargs)
+
+
 async def process_call(
     entity_id: int,
     call_type: str,
@@ -320,6 +424,7 @@ async def process_call(
     phone: str = "",
     entity_type: str = "leads",
     call_direction: str = "call_in",
+    expected_duration: Optional[int] = None,
 ):
     """
     Основная функция обработки звонка.
@@ -388,11 +493,17 @@ async def process_call(
         
         logger.info("📥 Скачиваем запись...")
         audio_data = await amocrm_service.download_call_recording(record_url)
-        
+
         if len(audio_data) < 10000:
             logger.warning(f"⚠️ Файл слишком маленький ({len(audio_data)} байт)")
             return
-        
+
+        # 2.1. Проверяем длительность скачанного аудио vs ожидаемой (защита от неготовой записи)
+        if expected_duration and expected_duration > 10:
+            audio_data = await _ensure_full_recording(
+                audio_data, record_url, expected_duration
+            )
+
         # 3. Транскрибируем
         logger.info("🎙️ Транскрибация...")
         transcription = await transcription_service.transcribe_audio(
@@ -685,11 +796,16 @@ async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
             logger.info(f"⏭️ Примечание #{note_id} не звонок (тип: {actual_note_type})")
             return JSONResponse(content={"status": "not_a_call", "note_type": actual_note_type}, status_code=200)
         
-        # 7. Извлекаем ссылку на запись
+        # 7. Извлекаем ссылку на запись и длительность
         params = note_data.get("params", {})
         record_url = params.get("link")
         phone = params.get("phone", "")
-        
+        call_duration = params.get("duration")  # длительность в секундах от АТС
+        try:
+            call_duration = int(call_duration) if call_duration else None
+        except (ValueError, TypeError):
+            call_duration = None
+
         if not record_url:
             logger.warning(f"⚠️ Примечание #{note_id} без записи")
             return JSONResponse(content={"status": "no_recording"}, status_code=200)
@@ -700,9 +816,17 @@ async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
         call_type = "incoming_call" if actual_note_type == "call_in" else "outgoing_call"
         
         # 9. Запускаем обработку в фоне
+        # Начальная задержка: даём vmclouds время на обработку записи
+        if call_duration and call_duration > 30:
+            initial_delay = 15  # 15 секунд для записей длиннее 30с
+            logger.info(f"⏳ Ждём {initial_delay}с перед скачиванием (запись {call_duration}с, vmclouds может быть не готов)")
+        else:
+            initial_delay = 0
+
         raw_created_at = note_data.get("created_at")
         background_tasks.add_task(
-            process_call,
+            _delayed_process_call,
+            delay=initial_delay,
             entity_id=element_id,
             call_type=call_type,
             record_url=record_url,
@@ -711,6 +835,7 @@ async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
             phone=phone,
             entity_type=entity_type,
             call_direction=actual_note_type,
+            expected_duration=call_duration,
         )
         
         return JSONResponse(content={"status": "processing", "note_id": note_id}, status_code=200)
