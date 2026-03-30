@@ -7,6 +7,7 @@ FastAPI сервер с webhook endpoint для AmoCRM.
 """
 import logging
 import asyncio
+import re
 import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -51,6 +52,83 @@ WORK_TYPE_ENUM_MAP = {
     "межевание и тех план": 1344645,
     "межевание и техплан": 1344645,
 }
+
+
+# ============== Маппинг тег → enum_id для поля "Источник" (field_id=212063) ==============
+TAG_TO_SOURCE_ENUM = {
+    "2гис": 423423,       # 2GIS
+    "2gis": 423423,
+    "авито": 423433,      # Авито
+    "avito": 423433,
+    "seo": 423411,        # SEO
+    "ltv": 423413,        # LTV
+    "ltv-сарафан": 423415,
+    "ltv-тиу": 423425,
+    "ltv-пульс": 423427,
+    "пульс цен": 423421,
+    "рекомендация": 423429,
+    "улица": 423431,
+    "торги": 423437,
+    "1777": 706911,
+    "инстаграмм": 706913,
+    "instagram": 706913,
+    "юла": 707821,
+    "личные": 709191,
+    "оффлайн": 855121,
+    "исходящий": 1237601,
+    "агентство недвижимости": 1260789,
+    "городской": 1276687,
+    "яндекс ук": 1342883,
+    "profzem": 1342911,
+    "почта": 1343301,
+    "кадуслуги": 1343847,
+    "сайт кадуслуги": 1343847,
+    "lp new яндекс": 423407,
+    "lp new google": 423409,
+    "менеджер": 423419,
+}
+
+
+def _match_tag_to_source(tags: list) -> int | None:
+    """Ищет enum_id для поля Источник по тегам сделки."""
+    for tag in tags:
+        tag_name = (tag.get("name") or "").lower().strip()
+        if tag_name in TAG_TO_SOURCE_ENUM:
+            return TAG_TO_SOURCE_ENUM[tag_name]
+        # Частичное совпадение
+        for keyword, enum_id in TAG_TO_SOURCE_ENUM.items():
+            if keyword in tag_name or tag_name in keyword:
+                return enum_id
+    return None
+
+
+# Сокращения для названий сделок (стиль менеджера)
+WORK_TYPE_SHORT_NAME = {
+    "межевание": "МП",
+    "межевой план": "МП",
+    "техплан": "ТП",
+    "технический план": "ТП",
+    "топосъёмка": "ТС",
+    "топосъемка": "ТС",
+    "топографическая съёмка": "ТС",
+    "топографическая съемка": "ТС",
+    "вынос": "Вынос",
+    "вынос в натуру": "Вынос",
+    "вынос границ": "Вынос",
+}
+
+
+def _shorten_work_type(work_type_text: str) -> str:
+    """Возвращает сокращение для названия сделки, или оригинал если нет сокращения."""
+    if not work_type_text:
+        return ""
+    text = work_type_text.lower().strip()
+    if text in WORK_TYPE_SHORT_NAME:
+        return WORK_TYPE_SHORT_NAME[text]
+    for keyword, short in WORK_TYPE_SHORT_NAME.items():
+        if keyword in text:
+            return short
+    return work_type_text
 
 
 def _match_work_type_enum(work_type_text: str):
@@ -138,6 +216,19 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
         custom_fields = []
         price_to_set = None
 
+        # 0. Источник по тегам (field_id=212063, select)
+        if 212063 not in existing_fields:
+            tags = lead_data.get("_embedded", {}).get("tags", [])
+            if tags:
+                source_enum_id = _match_tag_to_source(tags)
+                if source_enum_id:
+                    custom_fields.append({
+                        "field_id": 212063,
+                        "values": [{"enum_id": source_enum_id}]
+                    })
+                    tag_names = ", ".join(t.get("name", "") for t in tags)
+                    logger.info(f"  📢 Источник (по тегам [{tag_names}]): enum_id={source_enum_id}")
+
         # 1. Город (field_id=212029, text)
         if 212029 not in existing_fields:
             city = getattr(analysis, "client_city", "")
@@ -200,19 +291,28 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
         # 7. Название сделки: "{work_type} {location}" — только если текущее дефолтное
         name_to_set = None
         existing_name = lead_data.get("name", "") or ""
+        # Считаем имя дефолтным, если оно:
+        # - пустое
+        # - начинается с "Входящий звонок" / "Исходящий звонок" (наша система)
+        # - начинается с "Входящий +" / "Исходящий +" (AmoCRM автосоздание)
+        # - начинается с "Входящий" / "Исходящий" и содержит номер телефона
         is_default_name = (
             not existing_name
             or existing_name.startswith("Входящий звонок")
             or existing_name.startswith("Исходящий звонок")
+            or existing_name.startswith("Входящий +")
+            or existing_name.startswith("Исходящий +")
+            or bool(re.match(r"^(Входящий|Исходящий)\s+\+?\d", existing_name))
         )
         if is_default_name:
             work_type = getattr(analysis, "work_type", "")
             location = getattr(analysis, "location", "")
-            if work_type and work_type.lower() not in ("консультация", "не определено", ""):
+            if work_type and work_type.lower() not in ("консультация", "не определено", "не обсуждали", ""):
+                short_name = _shorten_work_type(work_type)
                 if location and location.lower() not in ("не указано", "не определено", ""):
-                    name_to_set = f"{work_type} {location}"
+                    name_to_set = f"{short_name} {location}"
                 else:
-                    name_to_set = work_type
+                    name_to_set = short_name
                 logger.info(f"  🏷️ Название сделки: {name_to_set}")
 
         # Отправляем PATCH если есть что обновлять
