@@ -51,6 +51,13 @@ WORK_TYPE_ENUM_MAP = {
     "подбор зу": 1342589,
     "межевание и тех план": 1344645,
     "межевание и техплан": 1344645,
+    "прочие": 1324619,
+    "подача в рр через лк": 1344085,
+    "все виды изысканий": 1314061,
+    "снижение кс": 423489,
+    "ппт": 423481,
+    "гидрометеорология": 423499,
+    "водоохранная зона": 423509,
 }
 
 
@@ -242,7 +249,7 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
         # 2. Интерес / work_type (field_id=212083, select)
         if 212083 not in existing_fields:
             work_type = getattr(analysis, "work_type", "")
-            if work_type and work_type.lower() not in ("консультация", "не обсуждали", "не указано", ""):
+            if work_type and work_type.lower() not in ("не обсуждали", "не указано", "не определено", ""):
                 enum_id = _match_work_type_enum(work_type)
                 if enum_id:
                     custom_fields.append({
@@ -307,7 +314,7 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
         if is_default_name:
             work_type = getattr(analysis, "work_type", "")
             location = getattr(analysis, "location", "")
-            if work_type and work_type.lower() not in ("консультация", "не определено", "не обсуждали", ""):
+            if work_type and work_type.lower() not in ("не определено", "не обсуждали", ""):
                 short_name = _shorten_work_type(work_type)
                 if location and location.lower() not in ("не указано", "не определено", ""):
                     name_to_set = f"{short_name} {location}"

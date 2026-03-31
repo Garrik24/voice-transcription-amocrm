@@ -98,11 +98,21 @@ class TranscriptionService:
         Разделяет стерео на 2 канала, транскрибирует каждый через Whisper,
         склеивает по таймстемпам.
 
-        Левый канал (0) = Менеджер
-        Правый канал (1) = Клиент
+        Входящий звонок (call_in): Левый канал (0) = Менеджер, Правый (1) = Клиент (стабильно)
+        Исходящий звонок (call_out): каналы могут меняться → начальная разметка
+        как Спикер 1/2, роли определяются LLM-валидацией.
         """
         left_path = None
         right_path = None
+
+        # Для входящих: каналы стабильные (левый = менеджер)
+        # Для исходящих: каналы плавают, начальная разметка нейтральная
+        if call_direction == "call_out":
+            left_label = "Спикер 1"
+            right_label = "Спикер 2"
+        else:
+            left_label = "Менеджер"
+            right_label = "Клиент"
 
         try:
             # 1. Разделяем каналы через ffmpeg
@@ -113,27 +123,27 @@ class TranscriptionService:
             right_data = await self._read_and_optimize(right_path)
 
             logger.info(
-                f"📊 Левый (менеджер): {len(left_data)} байт, "
-                f"Правый (клиент): {len(right_data)} байт"
+                f"📊 Левый ({left_label}): {len(left_data)} байт, "
+                f"Правый ({right_label}): {len(right_data)} байт"
             )
 
             # 3. Транскрибируем оба канала параллельно
             logger.info("🎙️ Транскрибируем оба канала параллельно...")
             left_result, right_result = await asyncio.gather(
-                self._whisper_with_segments(left_data, "manager"),
-                self._whisper_with_segments(right_data, "client"),
+                self._whisper_with_segments(left_data, "left"),
+                self._whisper_with_segments(right_data, "right"),
             )
 
             left_text, left_segments = left_result
             right_text, right_segments = right_result
 
             logger.info(
-                f"📝 Менеджер: {len(left_text)} символов, {len(left_segments)} сегментов | "
-                f"Клиент: {len(right_text)} символов, {len(right_segments)} сегментов"
+                f"📝 {left_label}: {len(left_text)} символов, {len(left_segments)} сегментов | "
+                f"{right_label}: {len(right_text)} символов, {len(right_segments)} сегментов"
             )
 
             # 4. Склеиваем сегменты по таймстемпам
-            speakers = self._merge_segments(left_segments, right_segments)
+            speakers = self._merge_segments(left_segments, right_segments, left_label, right_label)
 
             # 4.1 LLM-валидация и исправление атрибуции спикеров
             speakers = await self._validate_and_fix_attribution(speakers, call_direction=call_direction)
@@ -267,16 +277,18 @@ class TranscriptionService:
         self,
         left_segments: List[dict],
         right_segments: List[dict],
+        left_label: str = "Менеджер",
+        right_label: str = "Клиент",
     ) -> List[Speaker]:
         """
         Склеивает сегменты двух каналов по таймстемпам в единый поток.
-        Левый = Менеджер, Правый = Клиент.
+        Метки определяются вызывающим кодом в зависимости от направления звонка.
         """
         speakers = []
 
         for seg in left_segments:
             speakers.append(Speaker(
-                label="Менеджер",
+                label=left_label,
                 text=seg["text"],
                 start_ms=int(seg["start"] * 1000),
                 end_ms=int(seg["end"] * 1000),
@@ -284,7 +296,7 @@ class TranscriptionService:
 
         for seg in right_segments:
             speakers.append(Speaker(
-                label="Клиент",
+                label=right_label,
                 text=seg["text"],
                 start_ms=int(seg["start"] * 1000),
                 end_ms=int(seg["end"] * 1000),
@@ -316,42 +328,59 @@ class TranscriptionService:
         transcript_text = "\n".join(transcript_lines)
 
         # Определяем контекст направления звонка
-        if call_direction == "call_out":
-            direction_context = """ВАЖНО: Это ИСХОДЯЩИЙ звонок (call_out). Менеджер НАБРАЛ номер клиента — значит:
-- Первая реплика обычно принадлежит КЛИЕНТУ — он снимает трубку и говорит "Алло?" / "Да?" / "Слушаю".
-- Менеджер обычно говорит ВТОРОЙ — представляется: "Здравствуйте, это компания...", "Добрый день, вас беспокоит...".
-- Ключевое: менеджер — тот, кто ИНИЦИАТОР разговора по делу, представляет компанию и предлагает услуги. Клиент — тот, кто ОТВЕЧАЕТ на звонок.
-- Если первая короткая реплика ("Алло", "Да", "Слушаю") помечена как "Менеджер" — скорее всего это ОШИБКА, это клиент снял трубку."""
-        else:
-            direction_context = """ВАЖНО: Это ВХОДЯЩИЙ звонок (call_in). Клиент НАБРАЛ номер компании — значит:
-- Первая реплика обычно принадлежит МЕНЕДЖЕРУ — он снимает трубку и говорит "Алло?" / "Компания Ставропольгеодезия, здравствуйте" / "Слушаю вас".
-- Клиент обычно говорит ВТОРОЙ — описывает зачем звонит: "Здравствуйте, мне нужно...", "Подскажите...", "Я хотел бы узнать...".
-- Ключевое: клиент — тот, кто ИНИЦИАТОР разговора по делу, описывает свою задачу. Менеджер — тот, кто ОТВЕЧАЕТ на звонок и консультирует.
-- Если первая реплика с приветствием от имени компании помечена как "Клиент" — скорее всего это ОШИБКА, это менеджер снял трубку."""
+        is_outgoing = call_direction == "call_out"
 
-        prompt = f"""Ты — система проверки атрибуции спикеров в расшифровке телефонного разговора.
+        if is_outgoing:
+            direction_context = """ВАЖНО: Это ИСХОДЯЩИЙ звонок (call_out). Менеджер НАБРАЛ номер клиента.
+Каналы записи НЕ привязаны к ролям — спикеры помечены как «Спикер 1» и «Спикер 2».
+Ты ДОЛЖЕН определить, кто из них Менеджер, а кто Клиент, по СОДЕРЖАНИЮ реплик.
+
+Подсказки:
+- Менеджер — ИНИЦИАТОР звонка, представляет компанию, предлагает услуги.
+- Клиент — ОТВЕЧАЕТ на звонок, обычно начинает с "Алло?" / "Да?" / "Слушаю"."""
+        else:
+            direction_context = """ВАЖНО: Это ВХОДЯЩИЙ звонок (call_in). Клиент НАБРАЛ номер компании.
+Роли предварительно размечены: Левый канал = Менеджер, Правый = Клиент.
+Проверь разметку по содержанию реплик и исправь если нужно.
+
+Подсказки:
+- Менеджер — ОТВЕЧАЕТ на звонок, обычно представляется от имени компании.
+- Клиент — ИНИЦИАТОР звонка, описывает свою задачу / потребность."""
+
+        if is_outgoing:
+            task_instruction = """Твоя задача: определить роли спикеров.
+Для КАЖДОГО спикера («Спикер 1» или «Спикер 2») определи, кто это: Менеджер или Клиент.
+
+Ответь в формате:
+Спикер 1=Менеджер
+Спикер 2=Клиент
+
+Или наоборот, если Спикер 1 — клиент."""
+        else:
+            task_instruction = """Твоя задача: проверить правильность ролей.
+Если роль определена НЕПРАВИЛЬНО, верни ТОЛЬКО номера строк которые нужно исправить, через запятую.
+Если все роли правильные — верни слово "OK"."""
+
+        prompt = f"""Ты — система определения ролей спикеров в расшифровке телефонного разговора геодезической компании.
 
 {direction_context}
 
-Дан транскрипт разговора между Менеджером и Клиентом. Каждая строка имеет формат: номер_строки|текущая_роль|текст
+Дан транскрипт разговора. Каждая строка имеет формат: номер_строки|текущая_роль|текст
 
-Правила определения ролей:
-- МЕНЕДЖЕР: представляет компанию, называет цены и сроки работ, предлагает услуги, объясняет процесс, спрашивает кадастровый номер / адрес / контактные данные клиента, говорит фразы типа "мы сделаем", "стоимость составит", "можем начать", "пришлите номер участка"
-- КЛИЕНТ: описывает свою задачу / проблему / участок, спрашивает о стоимости, соглашается или отказывается, сообщает свои данные, говорит фразы типа "мне нужно", "у меня участок", "сколько стоит", "а можно ли"
+Правила определения ролей (АНАЛИЗИРУЙ СОДЕРЖАНИЕ, а не только первую реплику!):
+- МЕНЕДЖЕР (сотрудник компании): говорит от лица компании («мы делаем», «мы не занимаемся», «у нас нет»), объясняет что компания может/не может, называет цены и сроки, предлагает или отказывает в услугах, говорит «у меня нет контактов», «я не подскажу» (от лица компании).
+- КЛИЕНТ (звонящий): описывает свою задачу/проблему, СПРАШИВАЕТ «у вас есть...?», «вы занимаетесь...?», «а можно...?», ищет услугу или подрядчика, реагирует на ответы менеджера.
 
-Проверь каждую строку. Если роль определена НЕПРАВИЛЬНО (например, клиент говорит фразу менеджера или наоборот), верни ТОЛЬКО номера строк которые нужно исправить, через запятую.
+КРИТИЧЕСКИ ВАЖНО: Не путай роли! Если спикер говорит «мы водой не занимаемся», «нет у меня контактов», «не подскажу» — это МЕНЕДЖЕР, даже если он помечен как Клиент. Если спикер спрашивает «у вас есть ферма, которая находит воду?», «вы сами пробуриваете?» — это КЛИЕНТ, даже если он помечен как Менеджер.
 
-Если все роли правильные — верни слово "OK".
+{task_instruction}
 
 ВАЖНО:
-- Обычно ошибки идут блоками (несколько подряд неправильных строк), а не по одной.
-- Если в начале разговора роли определены правильно, а потом "переключились" — значит все строки после точки переключения неправильные.
-- Не исправляй строки если ты не уверен.
+- Каналы могут быть перепутаны ПОЛНОСТЬЮ — ВСЕ реплики одного спикера на самом деле принадлежат другому. Это частый случай!
+- Анализируй СМЫСЛ реплик, а не только формальные маркеры.
 
 Транскрипт:
-{transcript_text}
-
-Ответ (только номера строк через запятую, диапазоны через дефис, или "OK"):"""
+{transcript_text}"""
 
         try:
             response = await self._openai_client.chat.completions.create(
@@ -364,50 +393,106 @@ class TranscriptionService:
             answer = response.choices[0].message.content.strip()
             logger.info(f"🔍 LLM проверка атрибуции ({call_direction}): {answer}")
 
-            if answer.upper() == "OK":
-                logger.info("✅ Атрибуция спикеров корректна")
-                return speakers
-
-            # Парсим номера строк для исправления
-            try:
-                fix_indices = set()
-                for part in answer.replace(" ", "").split(","):
-                    part = part.strip()
-                    if part.isdigit():
-                        fix_indices.add(int(part))
-                    elif "-" in part:
-                        range_parts = part.split("-")
-                        if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
-                            start, end = int(range_parts[0]), int(range_parts[1])
-                            fix_indices.update(range(start, end + 1))
-
-                if not fix_indices:
-                    logger.warning(f"⚠️ Не удалось распарсить ответ LLM: {answer}")
-                    return speakers
-
-                # Исправляем роли
-                fixed_count = 0
-                for i in fix_indices:
-                    if 0 <= i < len(speakers):
-                        old_label = speakers[i].label
-                        new_label = "Клиент" if old_label == "Менеджер" else "Менеджер"
-                        speakers[i] = Speaker(
-                            label=new_label,
-                            text=speakers[i].text,
-                            start_ms=speakers[i].start_ms,
-                            end_ms=speakers[i].end_ms,
-                        )
-                        fixed_count += 1
-
-                logger.info(f"🔧 Исправлена атрибуция у {fixed_count} реплик из {len(speakers)}")
-                return speakers
-
-            except Exception as e:
-                logger.warning(f"⚠️ Ошибка парсинга ответа LLM ({answer}): {e}")
-                return speakers
+            if is_outgoing:
+                # Для исходящих: парсим назначение ролей "Спикер 1=Менеджер"
+                return self._apply_role_assignment(speakers, answer)
+            else:
+                # Для входящих: парсим номера строк для флипа
+                return self._apply_role_fixes(speakers, answer)
 
         except Exception as e:
             logger.error(f"❌ LLM валидация атрибуции не удалась: {e}")
+            return speakers
+
+    def _apply_role_assignment(self, speakers: List[Speaker], answer: str) -> List[Speaker]:
+        """
+        Парсит ответ LLM для исходящих звонков в формате:
+        'Спикер 1=Менеджер\nСпикер 2=Клиент'
+        и назначает роли.
+        """
+        try:
+            role_map = {}
+            for line in answer.splitlines():
+                line = line.strip()
+                if "=" not in line:
+                    continue
+                speaker_part, role_part = line.split("=", 1)
+                speaker_part = speaker_part.strip()
+                role_part = role_part.strip()
+                # Нормализуем роль
+                if "менеджер" in role_part.lower():
+                    role_map[speaker_part] = "Менеджер"
+                elif "клиент" in role_part.lower():
+                    role_map[speaker_part] = "Клиент"
+
+            if not role_map:
+                logger.warning(f"⚠️ Не удалось распарсить назначение ролей: {answer}")
+                # Фолбэк: оставляем как есть, но переименовываем Спикер → Менеджер/Клиент
+                # по умолчанию Спикер 1 = Менеджер
+                role_map = {"Спикер 1": "Менеджер", "Спикер 2": "Клиент"}
+
+            fixed_count = 0
+            for i, s in enumerate(speakers):
+                if s.label in role_map:
+                    new_label = role_map[s.label]
+                    speakers[i] = Speaker(
+                        label=new_label,
+                        text=s.text,
+                        start_ms=s.start_ms,
+                        end_ms=s.end_ms,
+                    )
+                    fixed_count += 1
+
+            logger.info(f"🔧 Назначены роли для {fixed_count} реплик: {role_map}")
+            return speakers
+
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка парсинга назначения ролей ({answer}): {e}")
+            return speakers
+
+    def _apply_role_fixes(self, speakers: List[Speaker], answer: str) -> List[Speaker]:
+        """
+        Парсит ответ LLM для входящих звонков — номера строк для флипа или "OK".
+        """
+        if answer.upper() == "OK":
+            logger.info("✅ Атрибуция спикеров корректна")
+            return speakers
+
+        try:
+            fix_indices = set()
+            for part in answer.replace(" ", "").split(","):
+                part = part.strip()
+                if part.isdigit():
+                    fix_indices.add(int(part))
+                elif "-" in part:
+                    range_parts = part.split("-")
+                    if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
+                        start, end = int(range_parts[0]), int(range_parts[1])
+                        fix_indices.update(range(start, end + 1))
+
+            if not fix_indices:
+                logger.warning(f"⚠️ Не удалось распарсить ответ LLM: {answer}")
+                return speakers
+
+            # Исправляем роли
+            fixed_count = 0
+            for i in fix_indices:
+                if 0 <= i < len(speakers):
+                    old_label = speakers[i].label
+                    new_label = "Клиент" if old_label == "Менеджер" else "Менеджер"
+                    speakers[i] = Speaker(
+                        label=new_label,
+                        text=speakers[i].text,
+                        start_ms=speakers[i].start_ms,
+                        end_ms=speakers[i].end_ms,
+                    )
+                    fixed_count += 1
+
+            logger.info(f"🔧 Исправлена атрибуция у {fixed_count} реплик из {len(speakers)}")
+            return speakers
+
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка парсинга ответа LLM ({answer}): {e}")
             return speakers
 
     # -------------------------------------------------------------------------
