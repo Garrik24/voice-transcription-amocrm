@@ -635,6 +635,16 @@ async def process_call(
             logger.warning("⚠️ Транскрибация пустая даже после retry — пропускаем обработку")
             return
 
+        # 3.1. Проверяем минимальную длину транскрибации
+        # Слишком короткий текст = звонок не состоялся (гудки, "алло-алло", сброс)
+        transcript_text = (transcription.full_text or "").strip()
+        if len(transcript_text) < 100:
+            logger.info(
+                f"⏭️ Транскрибация слишком короткая ({len(transcript_text)} символов) — "
+                "звонок не состоялся, пропускаем обработку"
+            )
+            return
+
         # 4. Определяем роли
         if transcription.speakers:
             roles = transcription_service.identify_roles(transcription.speakers)
@@ -1048,7 +1058,16 @@ async def process_uploaded_audio(
         if not (transcription.full_text or "").strip():
             logger.warning("⚠️ Транскрибация пустая даже после retry — пропускаем обработку")
             return
-        
+
+        # 1.1. Проверяем минимальную длину транскрибации
+        transcript_text = (transcription.full_text or "").strip()
+        if len(transcript_text) < 100:
+            logger.info(
+                f"⏭️ Транскрибация слишком короткая ({len(transcript_text)} символов) — "
+                "звонок не состоялся, пропускаем обработку"
+            )
+            return
+
         # 2. Определяем роли
         if transcription.speakers:
             roles = transcription_service.identify_roles(transcription.speakers)
