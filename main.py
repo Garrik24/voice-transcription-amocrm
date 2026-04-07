@@ -635,13 +635,12 @@ async def process_call(
             logger.warning("⚠️ Транскрибация пустая даже после retry — пропускаем обработку")
             return
 
-        # 3.1. Проверяем минимальную длину транскрибации
-        # Слишком короткий текст = звонок не состоялся (гудки, "алло-алло", сброс)
-        transcript_text = (transcription.full_text or "").strip()
-        if len(transcript_text) < 100:
+        # 3.1. Проверяем длительность звонка
+        # Меньше 60 секунд = автоответчик, сброс, не состоялся — не обрабатываем
+        if transcription.duration_seconds < 60:
             logger.info(
-                f"⏭️ Транскрибация слишком короткая ({len(transcript_text)} символов) — "
-                "звонок не состоялся, пропускаем обработку"
+                f"⏭️ Звонок слишком короткий ({transcription.duration_seconds:.0f} сек < 60 сек) — "
+                "пропускаем обработку"
             )
             return
 
@@ -1059,12 +1058,11 @@ async def process_uploaded_audio(
             logger.warning("⚠️ Транскрибация пустая даже после retry — пропускаем обработку")
             return
 
-        # 1.1. Проверяем минимальную длину транскрибации
-        transcript_text = (transcription.full_text or "").strip()
-        if len(transcript_text) < 100:
+        # 1.1. Проверяем длительность звонка
+        if transcription.duration_seconds < 60:
             logger.info(
-                f"⏭️ Транскрибация слишком короткая ({len(transcript_text)} символов) — "
-                "звонок не состоялся, пропускаем обработку"
+                f"⏭️ Звонок слишком короткий ({transcription.duration_seconds:.0f} сек < 60 сек) — "
+                "пропускаем обработку"
             )
             return
 
