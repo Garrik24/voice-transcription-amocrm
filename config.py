@@ -82,6 +82,15 @@ YANDEX_STT_LANGUAGE = os.getenv("YANDEX_STT_LANGUAGE", "ru-RU")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # ID чата для уведомлений об ошибках
 
+# ============== Инфраструктурные алерты ==============
+# Алертим только на сбои, останавливающие конвейер (кончился баланс / отозван ключ).
+# Обычные ошибки звонков по-прежнему только логируются — иначе один сбой
+# провайдера даёт десятки сообщений подряд.
+ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "true").strip().lower() == "true"
+
+# Минимальный интервал между повторными алертами одного класса, минут
+ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "30"))
+
 # ============== Приложение ==============
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 PORT = int(os.getenv("PORT", 8000))

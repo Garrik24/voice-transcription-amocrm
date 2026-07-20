@@ -20,6 +20,7 @@ from services.amocrm import amocrm_service
 from services.transcription import transcription_service
 from services.analysis import analysis_service
 from services.telegram import telegram_service
+from services import alerts
 
 # ============== Маппинг work_type → enum_id для поля "Интерес" (field_id=212083) ==============
 WORK_TYPE_ENUM_MAP = {
@@ -616,6 +617,8 @@ async def process_call(
         transcription = await transcription_service.transcribe_audio(
             audio_data, speaker_labels=True, call_direction=call_direction,
         )
+        # STT ответил — если до этого был зафиксирован сбой, сообщим о восстановлении
+        await alerts.notify_recovered("OpenAI")
 
         if not (transcription.full_text or "").strip():
             logger.warning("⚠️ Пустая транскрибация (с диаризацией). Пробуем без диаризации...")
@@ -769,7 +772,10 @@ async def process_call(
         
     except Exception as e:
         logger.error(f"❌ Ошибка обработки звонка для сделки #{lead_id}: {e}")
-        # НЕ отправляем ошибки в Telegram - только логируем (избегаем спама)
+        # Обычные ошибки звонка НЕ шлём в Telegram (избегаем спама) — только логируем.
+        # Но если это инфраструктурный сбой (кончился баланс / отозван ключ),
+        # конвейер стоит целиком, и об этом нужно узнать сразу. Троттлинг внутри.
+        await alerts.maybe_alert(e, lead_id=lead_id)
 
 
 @app.get("/")
@@ -1039,6 +1045,7 @@ async def process_uploaded_audio(
         transcription = await transcription_service.transcribe_audio(
             audio_data, speaker_labels=True, call_direction=call_direction,
         )
+        await alerts.notify_recovered("OpenAI")
 
         if not (transcription.full_text or "").strip():
             logger.warning("⚠️ Пустая транскрибация (с диаризацией). Пробуем без диаризации...")
@@ -1159,6 +1166,7 @@ async def process_uploaded_audio(
         
     except Exception as e:
         logger.error(f"❌ Ошибка обработки загруженного файла: {e}")
+        await alerts.maybe_alert(e, lead_id=lead_id)
 
 
 if __name__ == "__main__":
