@@ -27,6 +27,8 @@ class TestAutofillHelpers(unittest.TestCase):
 class TestAutoFillLeadFields(unittest.IsolatedAsyncioTestCase):
     async def test_does_not_override_existing_fields(self):
         lead_data = {
+            # Имя задано менеджером (не «Входящий +7...») — не перезаписывается
+            "name": "ТС Ставрополь, ул. Мира 1",
             "price": 35000,
             "custom_fields_values": [
                 {"field_id": 212029, "values": [{"value": "Ставрополь"}]},

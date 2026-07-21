@@ -9,6 +9,7 @@ import logging
 import asyncio
 import re
 import shutil
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
@@ -343,6 +344,102 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
         # Не валим основной пайплайн из-за ошибки автозаполнения
         logger.error(f"❌ Ошибка автозаполнения сделки #{lead_id}: {e}")
 
+
+# ============== Имя клиента → карточка контакта ==============
+
+CLIENT_NAME_STOPWORDS = {"клиент", "не представился", "не указано", "не определено", "неизвестно"}
+
+
+def _clean_client_name(raw: Optional[str]) -> Optional[str]:
+    """
+    Готовит имя из анализа к записи в карточку: убирает скобки с организацией
+    («Александр (Управление Росреестра)» → «Александр») и мусорные значения.
+    """
+    if not raw:
+        return None
+    name = re.sub(r"\([^)]*\)", " ", raw)
+    name = re.sub(r"\s+", " ", name).strip(" ,.-— ")
+    if not name or name.lower() in CLIENT_NAME_STOPWORDS:
+        return None
+    return name
+
+
+def _is_default_contact_name(name: str) -> bool:
+    """
+    Дефолтные имена, которые можно перезаписывать: пустое, голый номер телефона
+    или автоимя amoCRM вида «Входящий +78652951729 (9280058522 - Менеджер)».
+    Тот же паттерн, что для названий сделок в auto_fill_lead_fields.
+    """
+    if not name:
+        return True
+    stripped = name.lstrip("+").replace(" ", "").replace("-", "")
+    if stripped.isdigit():
+        return True
+    return bool(re.match(r"^(Входящий|Исходящий)\s+\+?\d", name))
+
+
+async def _update_contact_name_from_analysis(analysis, entity_type: str, entity_id: int, lead_id: int):
+    """
+    Пишет имя клиента из анализа в карточку контакта.
+    Контакт: entity_id вебхука (если вебхук был про контакт) или главный контакт
+    сделки из _embedded.contacts — вебхуки телефонии приходят с entity_type="leads",
+    поэтому путь через сделку основной.
+    Перезаписываем ТОЛЬКО дефолтные имена — ручной ввод менеджера не трогаем.
+    """
+    try:
+        client_name = _clean_client_name(getattr(analysis, "client_name", ""))
+        if not client_name:
+            return
+
+        if entity_type.lower() in ("contact", "contacts"):
+            contact_id = entity_id
+        else:
+            lead_data = await amocrm_service.get_lead(lead_id)
+            contacts = ((lead_data or {}).get("_embedded") or {}).get("contacts") or []
+            main_contacts = [c for c in contacts if c.get("is_main")]
+            contact = (main_contacts or contacts or [None])[0]
+            contact_id = contact.get("id") if contact else None
+
+        if not contact_id:
+            logger.info(f"⏭️ Имя контакта: у сделки #{lead_id} нет привязанного контакта")
+            return
+
+        contact_data = await amocrm_service.get_contact(contact_id)
+        if not contact_data:
+            return
+        current_name = contact_data.get("name", "") or ""
+        if not _is_default_contact_name(current_name):
+            logger.info(f"⏭️ Имя контакта #{contact_id} заполнено вручную, не трогаем: {current_name!r}")
+            return
+
+        if await amocrm_service.update_contact_name(contact_id, client_name):
+            logger.info(f"👤 Имя контакта #{contact_id}: {current_name!r} → {client_name!r}")
+
+    except Exception as e:
+        # Имя — вторично; не валим основной пайплайн
+        logger.error(f"❌ Ошибка обновления имени контакта для сделки #{lead_id}: {e}")
+
+
+_suspicious_alert_last = 0.0
+
+
+async def _alert_suspicious_diarization(lead_id: int, reason: str):
+    """Telegram-алерт о сомнительной диаризации, не чаще раза в 30 минут."""
+    global _suspicious_alert_last
+    if time.time() - _suspicious_alert_last < 1800:
+        return
+    _suspicious_alert_last = time.time()
+    try:
+        await telegram_service.send_message(
+            "⚠️ <b>Диаризация под сомнением</b>\n\n"
+            f"Сделка: #{lead_id}\n"
+            f"Причина: {reason}\n\n"
+            "Расшифровка сохранена, автозаполнение полей пропущено."
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось отправить алерт о диаризации: {e}")
+
+
 # Настраиваем логирование
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -669,28 +766,26 @@ async def process_call(
             call_direction=call_direction,
         )
 
-        # 5.5. Автозаполнение полей сделки
-        if target_entity_type == "leads":
-            await auto_fill_lead_fields(lead_id, analysis, call_type_simple)
+        # 5.5. Автозаполнение — только при достоверной диаризации (fail-closed):
+        # если роли под сомнением, поля и имя контакта НЕ трогаем (чтобы не записать
+        # данные менеджера как данные клиента), но расшифровку сохраняем и алертим.
+        stats = getattr(analysis, "speaker_stats", None)
+        suspicious_reasons = []
+        if stats is not None and getattr(stats, "suspicious_diarization", False):
+            suspicious_reasons.append(getattr(stats, "suspicious_reason", "") or "speaker_stats")
+        if getattr(transcription, "roles_uncertain", False):
+            suspicious_reasons.append("roles_uncertain")
 
-        # 5.6. Обновление имени контакта (если привязан к контакту)
-        normalized_check_type = entity_type.lower()
-        if normalized_check_type in ["contact", "contacts"]:
-            contact_id = entity_id  # entity_id = исходный ID контакта
-            client_name = getattr(analysis, "client_name", "")
-            if client_name and client_name.lower() not in ("клиент", "не представился", ""):
-                # Проверяем, что текущее имя дефолтное (номер телефона или пустое)
-                contact_data = await amocrm_service.get_contact(contact_id)
-                if contact_data:
-                    current_name = contact_data.get("name", "") or ""
-                    # Считаем дефолтным: пустое, или начинается с цифры/+  (номер телефона)
-                    is_default = (
-                        not current_name
-                        or current_name.lstrip("+").replace(" ", "").replace("-", "").isdigit()
-                    )
-                    if is_default:
-                        await amocrm_service.update_contact_name(contact_id, client_name)
-                        logger.info(f"  👤 Имя контакта #{contact_id}: '{current_name}' → '{client_name}'")
+        if suspicious_reasons:
+            reason_text = ", ".join(suspicious_reasons)
+            logger.warning(f"🚫 Диаризация под сомнением ({reason_text}) — автозаполнение пропущено")
+            await _alert_suspicious_diarization(lead_id, reason_text)
+        else:
+            if target_entity_type == "leads":
+                await auto_fill_lead_fields(lead_id, analysis, call_type_simple)
+
+            # 5.6. Имя клиента → карточка контакта (через вебхук-контакт или контакт сделки)
+            await _update_contact_name_from_analysis(analysis, entity_type, entity_id, lead_id)
 
         # 6. Формируем примечание
         note_text = analysis_service.format_note(
