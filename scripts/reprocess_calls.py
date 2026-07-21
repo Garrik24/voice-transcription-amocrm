@@ -32,7 +32,10 @@ from main import process_call, PROCESSED_CALLS
 START_UTC = datetime(2026, 6, 29, 5, 0, tzinfo=timezone.utc).timestamp()
 END_UTC = (datetime.now(timezone.utc) - timedelta(minutes=5)).timestamp()
 
-ANALYSIS_MARKER = "🎙️ АНАЛИЗ ЗВОНКА"
+# БЕЗ эмодзи: amoCRM обрезает 🎙️ (U+1F399, вне BMP) при сохранении примечания —
+# в CRM остаётся только вариационный селектор. Маркер с эмодзи не совпадал
+# никогда, guard молча пропускал и создавал дубли примечаний.
+ANALYSIS_MARKER = "АНАЛИЗ ЗВОНКА"
 # Окно «примечание относится к этому звонку», сек: анализ постится вскоре после звонка.
 NOTE_MATCH_BEFORE = 60       # небольшой допуск назад
 NOTE_MATCH_AFTER = 30 * 60   # до 30 минут после звонка
