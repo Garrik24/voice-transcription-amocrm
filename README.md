@@ -54,7 +54,9 @@ voice-transcription/
 |------------|----------|
 | `AMOCRM_DOMAIN` | твой-домен.amocrm.ru |
 | `AMOCRM_ACCESS_TOKEN` | токен из AmoCRM |
-| `ASSEMBLYAI_API_KEY` | ключ из AssemblyAI |
+| `ASSEMBLYAI_API_KEY` | ключ из AssemblyAI — резервный STT (см. ниже) |
+| `STT_FALLBACK_ENABLED` | автопереход на AssemblyAI при сбое Whisper (по умолчанию `true`) |
+| `STT_FALLBACK_RETRY_MINUTES` | через сколько минут пробовать Whisper снова (по умолчанию `30`) |
 | `LLM_PROVIDER` | `openai` или `gemini` (по умолчанию `openai`) |
 | `OPENAI_API_KEY` | ключ из OpenAI (нужен если `LLM_PROVIDER=openai`) |
 | `OPENAI_MODEL` | модель OpenAI (опционально, по умолчанию `gpt-4o-mini`) |
@@ -76,6 +78,21 @@ voice-transcription/
 2. Добавь новый webhook:
    - **URL**: `https://your-service.up.railway.app/webhook/amocrm`
    - **События**: Добавление примечания (note_add)
+
+## 🔁 Резервный STT
+
+Основной провайдер — **Whisper** (лучшее качество русского). Если он отвалился
+по инфраструктурной причине (кончился баланс OpenAI, отозван ключ), сервис
+автоматически переключается на **AssemblyAI** и присылает уведомление в Telegram.
+Через `STT_FALLBACK_RETRY_MINUTES` минут снова пробует Whisper; при успехе
+возвращается на него.
+
+Обычные ошибки (сеть, битая запись) переключение **не** вызывают — иначе один
+плохой звонок увёл бы весь конвейер на резерв.
+
+Качество распознавания русского у AssemblyAI ниже, поэтому это аварийный режим,
+а не равноценная замена. Провайдер, которым расшифрован звонок, виден в шапке
+примечания в amoCRM (`STT: Whisper` / `STT: AssemblyAI`).
 
 ## 🔧 Локальная разработка
 

@@ -26,7 +26,13 @@ from typing import Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
-from config import OPENAI_API_KEY
+from config import (
+    ASSEMBLYAI_API_KEY,
+    ASSEMBLYAI_SPEECH_MODEL,
+    OPENAI_API_KEY,
+    STT_FALLBACK_ENABLED,
+    STT_FALLBACK_RETRY_MINUTES,
+)
 from services.telegram import telegram_service
 
 logger = logging.getLogger(__name__)
@@ -87,6 +93,9 @@ class TranscriptionResult:
     roles_from_ai: bool = False
     # Роли каналов не определились уверенно → автозаполнение CRM блокируется
     roles_uncertain: bool = False
+    # Каким STT фактически расшифровано (может отличаться от настройки,
+    # если сработал автофолбэк) — попадает в шапку примечания amoCRM
+    stt_provider: str = "Whisper"
 
 
 @dataclass
@@ -102,6 +111,125 @@ class TranscriptionService:
 
     def __init__(self):
         self._openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        # Резервный провайдер активен до этого времени (unix ts). 0 = основной.
+        self._fallback_until: float = 0.0
+
+    # -------------------------------------------------------------------------
+    # Выбор STT-провайдера и автоматический фолбэк
+    # -------------------------------------------------------------------------
+
+    @property
+    def _fallback_active(self) -> bool:
+        return self._fallback_until > time.time()
+
+    @property
+    def active_provider(self) -> str:
+        """Кем фактически расшифровываем прямо сейчас."""
+        return "AssemblyAI" if self._fallback_active else "Whisper"
+
+    async def _stt_with_segments(
+        self, audio_data: bytes, channel_name: str
+    ) -> Tuple[str, List[dict]]:
+        """
+        Транскрибация одного канала с автоподменой провайдера.
+
+        Whisper — основной (лучшее качество русского). Если он отвалился по
+        инфраструктурной причине (кончился баланс, отозван ключ), переключаемся
+        на AssemblyAI и держим резерв STT_FALLBACK_RETRY_MINUTES минут, после
+        чего снова пробуем основной. Обычные ошибки (сеть, битое аудио)
+        переключения НЕ вызывают — иначе один плохой звонок уводит весь
+        конвейер на резервный провайдер.
+        """
+        if self._fallback_active:
+            return await self._assemblyai_with_segments(audio_data, channel_name)
+
+        try:
+            result = await self._whisper_with_segments(audio_data, channel_name)
+            if self._fallback_until:
+                # Основной ожил после периода резерва
+                self._fallback_until = 0.0
+                logger.info("✅ Whisper снова доступен — вернулись с резерва")
+            return result
+        except Exception as exc:
+            if not (STT_FALLBACK_ENABLED and ASSEMBLYAI_API_KEY and self._is_infra_failure(exc)):
+                raise
+            await self._activate_fallback(exc)
+            return await self._assemblyai_with_segments(audio_data, channel_name)
+
+    @staticmethod
+    def _is_infra_failure(exc: BaseException) -> bool:
+        """Сбой, который не пройдёт сам: баланс кончился или ключ отозван."""
+        # Импорт здесь: services.alerts тянет telegram, а тот — config;
+        # на уровне модуля получился бы цикл импортов.
+        from services import alerts
+        verdict = alerts.classify(exc)
+        return bool(verdict and verdict[1] == "OpenAI")
+
+    async def _activate_fallback(self, exc: BaseException):
+        already = self._fallback_active
+        self._fallback_until = time.time() + STT_FALLBACK_RETRY_MINUTES * 60
+        if already:
+            return
+        logger.error(f"🔁 Whisper недоступен ({exc}) — переключаемся на AssemblyAI")
+        try:
+            await telegram_service.send_message(
+                "🔁 <b>Переключение на резервный STT</b>\n\n"
+                "Whisper (OpenAI) недоступен — вероятно, кончился баланс или отозван ключ.\n"
+                "Звонки расшифровываются через <b>AssemblyAI</b>.\n\n"
+                "⚠️ Качество распознавания русского будет ниже обычного.\n"
+                f"Основной провайдер проверим снова через {STT_FALLBACK_RETRY_MINUTES} мин."
+            )
+        except Exception as tg_err:
+            logger.warning(f"⚠️ Не удалось отправить алерт о переключении STT: {tg_err}")
+
+    async def _assemblyai_with_segments(
+        self, audio_data: bytes, channel_name: str
+    ) -> Tuple[str, List[dict]]:
+        """
+        Транскрибация одного (моно) канала через AssemblyAI.
+
+        Отдаёт сегменты в том же формате, что и Whisper, поэтому весь
+        дальнейший пайплайн — энергетический гейт, дедуп, решение о ролях —
+        работает без изменений. Метрик no_speech_prob/compression_ratio у
+        AssemblyAI нет; они лишь усилители, первичный критерий — энергия канала.
+
+        SDK синхронный, поэтому уходим в отдельный поток.
+        """
+        import assemblyai as aai
+
+        def _run() -> Tuple[str, List[dict]]:
+            aai.settings.api_key = ASSEMBLYAI_API_KEY
+            cfg_kwargs = {"language_code": "ru", "punctuate": True, "format_text": True}
+            if ASSEMBLYAI_SPEECH_MODEL:
+                cfg_kwargs["speech_model"] = ASSEMBLYAI_SPEECH_MODEL
+
+            transcript = aai.Transcriber().transcribe(
+                audio_data, config=aai.TranscriptionConfig(**cfg_kwargs)
+            )
+            if transcript.status == aai.TranscriptStatus.error:
+                raise RuntimeError(f"AssemblyAI: {transcript.error}")
+
+            segments = []
+            for sentence in transcript.get_sentences():
+                text = (sentence.text or "").strip()
+                if text:
+                    segments.append({
+                        "text": text,
+                        "start": (sentence.start or 0) / 1000.0,  # мс → сек
+                        "end": (sentence.end or 0) / 1000.0,
+                        "no_speech_prob": 0.0,
+                        "avg_logprob": 0.0,
+                        "compression_ratio": 0.0,
+                    })
+            return transcript.text or "", segments
+
+        try:
+            full_text, segments = await asyncio.to_thread(_run)
+            logger.info(f"🅰️ AssemblyAI ({channel_name}): {len(segments)} сегм.")
+            return full_text, segments
+        except Exception as e:
+            logger.error(f"❌ AssemblyAI ошибка ({channel_name}): {e}")
+            raise
 
     async def transcribe_audio(
         self,
@@ -171,14 +299,13 @@ class TranscriptionService:
 
             # 3. Whisper на оба канала + энергетический профиль исходника — параллельно
             logger.info("🎙️ Транскрибируем оба канала параллельно...")
-            whisper_results, (left_profile, right_profile) = await asyncio.gather(
-                asyncio.gather(
-                    self._whisper_with_segments(left_data, "left"),
-                    self._whisper_with_segments(right_data, "right"),
-                ),
-                self._band_energy_profiles(input_path),
-            )
-            (_, left_segments), (_, right_segments) = whisper_results
+            # Каналы транскрибируем последовательно, а не параллельно: при сбое
+            # основного провайдера первый канал переключит режим на резервный,
+            # и второй сразу пойдёт туда же — вместо двух одинаковых падений.
+            energy_task = asyncio.create_task(self._band_energy_profiles(input_path))
+            _, left_segments = await self._stt_with_segments(left_data, "left")
+            _, right_segments = await self._stt_with_segments(right_data, "right")
+            left_profile, right_profile = await energy_task
 
             logger.info(
                 f"📝 Whisper: левый {len(left_segments)} сегм., "
@@ -227,6 +354,7 @@ class TranscriptionService:
                 language="ru",
                 roles_from_ai=True,
                 roles_uncertain=decision.uncertain,
+                stt_provider=self.active_provider,
             )
 
         finally:
@@ -773,37 +901,17 @@ class TranscriptionService:
 
     async def _transcribe_whisper(self, audio_data: bytes) -> TranscriptionResult:
         """
-        Транскрибация через OpenAI Whisper API.
-        Для моно записей — без диаризации, просто текст.
+        Транскрибация моно-записи (без диаризации) — с тем же автофолбэком
+        на AssemblyAI, что и стерео-путь.
         """
-        logger.info(f"📁 Размер аудио для Whisper: {len(audio_data)} байт")
+        logger.info(f"📁 Размер аудио для транскрибации: {len(audio_data)} байт")
 
-        suffix = self._detect_suffix(audio_data)
-        mime = self._get_mime(suffix)
-        filename = f"audio{suffix}"
+        full_text, segments = await self._stt_with_segments(audio_data, "моно")
 
-        logger.info("🎙️ Отправляем в OpenAI Whisper (whisper-1)...")
-
-        response = await self._openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=(filename, audio_data, mime),
-            language="ru",
-            response_format="verbose_json",
-            timestamp_granularities=["segment"],
-        )
-
-        full_text = response.text or ""
-        segments = getattr(response, "segments", []) or []
-        duration_seconds = 0.0
-        if segments:
-            last = segments[-1]
-            if isinstance(last, dict):
-                duration_seconds = float(last.get("end", 0))
-            else:
-                duration_seconds = float(getattr(last, "end", 0))
+        duration_seconds = float(segments[-1]["end"]) if segments else 0.0
 
         logger.info(
-            f"✅ Транскрибация завершена (Whisper моно): {len(full_text)} символов, "
+            f"✅ Транскрибация завершена (моно): {len(full_text)} символов, "
             f"{len(segments)} сегментов, {duration_seconds:.1f} сек"
         )
 
@@ -815,6 +923,7 @@ class TranscriptionService:
             confidence=1.0,
             language="ru",
             roles_from_ai=False,
+            stt_provider=self.active_provider,
         )
 
     # -------------------------------------------------------------------------

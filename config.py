@@ -17,21 +17,32 @@ AMOCRM_CLIENT_SECRET = os.getenv("AMOCRM_CLIENT_SECRET")
 AMOCRM_VERIFY_SSL = os.getenv("AMOCRM_VERIFY_SSL", "true").strip().lower() == "true"
 
 # ============== STT Provider ==============
-# assemblyai | yandex
+# whisper | assemblyai | yandex
 STT_PROVIDER = os.getenv("STT_PROVIDER", "whisper").strip().lower()
 
-# ============== AssemblyAI ==============
+# ============== AssemblyAI (резервный провайдер) ==============
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 
-# Модель распознавания для русских звонков
-ASSEMBLYAI_SPEECH_MODEL = os.getenv("ASSEMBLYAI_SPEECH_MODEL", "universal-2")
+# Автопереключение на AssemblyAI, когда основной провайдер отвалился
+# по инфраструктурной причине (кончился баланс / отозван ключ).
+# Обычные ошибки (сеть, битое аудио) переключение НЕ вызывают.
+STT_FALLBACK_ENABLED = os.getenv("STT_FALLBACK_ENABLED", "true").strip().lower() == "true"
+
+# Через сколько минут в режиме резерва пробовать основной провайдер снова
+STT_FALLBACK_RETRY_MINUTES = int(os.getenv("STT_FALLBACK_RETRY_MINUTES", "30"))
+
+# Модель распознавания. Пусто = дефолт AssemblyAI (проверено на русских
+# звонках: дефолт, best и universal дают одинаковый результат, nano падает).
+# Прежнее значение universal-2 невалидно для текущего SDK — оставляем пустым.
+ASSEMBLYAI_SPEECH_MODEL = os.getenv("ASSEMBLYAI_SPEECH_MODEL", "").strip()
 
 # Ожидаемое кол-во спикеров (для телефонных звонков = 2)
 ASSEMBLYAI_SPEAKERS_EXPECTED = int(os.getenv("ASSEMBLYAI_SPEAKERS_EXPECTED", "2"))
 
-# Multichannel: если телефония пишет стерео (каждый спикер на своём канале).
-# Временно включено по умолчанию для проверки качества диаризации.
-ASSEMBLYAI_MULTICHANNEL = os.getenv("ASSEMBLYAI_MULTICHANNEL", "true").strip().lower() == "true"
+# Multichannel не используется: каналы стерео разделяются нашим ffmpeg,
+# в AssemblyAI уходит уже моно-канал — так работает общий пайплайн
+# (энергетический гейт, дедуп, роли) независимо от провайдера.
+ASSEMBLYAI_MULTICHANNEL = os.getenv("ASSEMBLYAI_MULTICHANNEL", "false").strip().lower() == "true"
 
 # ============== OpenAI ==============
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")

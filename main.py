@@ -793,7 +793,9 @@ async def process_call(
             call_type=call_type_simple,
             duration_seconds=transcription.duration_seconds,
             manager_name=manager_name,
-            stt_provider=STT_PROVIDER,
+            # Фактический провайдер, а не настройка: при сбое Whisper
+            # сработает автофолбэк, и в шапке должно стоять «AssemblyAI»
+            stt_provider=getattr(transcription, "stt_provider", STT_PROVIDER),
         )
         
         # 7. Сохраняем в AmoCRM (в СДЕЛКУ!)
@@ -1196,7 +1198,9 @@ async def process_uploaded_audio(
             call_type=call_type_simple,
             duration_seconds=transcription.duration_seconds,
             manager_name=manager_name,
-            stt_provider=STT_PROVIDER,
+            # Фактический провайдер, а не настройка: при сбое Whisper
+            # сработает автофолбэк, и в шапке должно стоять «AssemblyAI»
+            stt_provider=getattr(transcription, "stt_provider", STT_PROVIDER),
         )
         
         # 5. Сохраняем в AmoCRM (в СДЕЛКУ!)
