@@ -194,21 +194,8 @@ class TranscriptionService:
             left_segments = self._dedupe_within_channel(left_segments, "левый")
             right_segments = self._dedupe_within_channel(right_segments, "правый")
 
-            # 4. Решение о ролях: детерминированная эвристика → LLM-тайбрейк → приор
-            decision = self._score_channels(left_segments, right_segments)
-            if decision.manager_channel is None:
-                decision = await self._llm_manager_channel(left_segments, right_segments, call_direction)
-            if decision.manager_channel is None:
-                # Не определили: берём приор (левый = менеджер), но помечаем
-                # неуверенность — автозаполнение по такому звонку не выполняется.
-                decision = RoleDecision("left", "prior", True)
-
-            # На совсем коротких звонках сигнала мало, а LLM склонен отвечать
-            # «уверен» и на пустом основании — форсируем fail-closed.
-            total_replies = len(left_segments) + len(right_segments)
-            if total_replies < 8 and not decision.uncertain:
-                logger.info(f"🎭 Мало реплик ({total_replies}) — решение о ролях помечено неуверенным")
-                decision = RoleDecision(decision.manager_channel, decision.source, True)
+            # 4. Решение о ролях: конвенция АТС → контентная эвристика → LLM-арбитраж
+            decision = await self._decide_roles(left_segments, right_segments, call_direction)
 
             logger.info(
                 f"🎭 Менеджер = {'левый' if decision.manager_channel == 'left' else 'правый'} канал "
@@ -524,15 +511,17 @@ class TranscriptionService:
         words = re.findall(r"\w+", text.lower())
         return len(words) >= 6 and len(set(words)) / len(words) < 0.34
 
-    @staticmethod
-    def _is_sound_tag(text: str) -> bool:
-        """
-        Whisper описывает звуковые события КАПСОМ («ТЕЛЕФОННЫЙ ЗВОНОК»,
-        «ТРЕВОЖНАЯ МУЗЫКА») — реальную речь он капсом не пишет.
-        Одиночные аббревиатуры (ЕГРН, ЗОИТ, МФЦ) не трогаем: только фразы 2+ слов.
-        """
-        words = text.split()
-        return len(words) >= 2 and text.upper() == text and any(c.isalpha() for c in text)
+    # Звуковые события, которые Whisper вписывает в транскрипт как текст.
+    # ТОЛЬКО точный блок-лист: правило «весь капс = не речь» не работает —
+    # Whisper иногда пишет капсом и реальные реплики (проверено на записях).
+    SOUND_TAGS = frozenset({
+        "телефонный звонок", "тревожная музыка", "музыка", "музыка на фоне",
+        "шум", "непонятный звук", "звонок", "гудки", "смех", "аплодисменты",
+    })
+
+    @classmethod
+    def _is_sound_tag(cls, text: str) -> bool:
+        return text.strip(" .,!…—-").lower() in cls.SOUND_TAGS
 
     # -------------------------------------------------------------------------
     # Дедупликация
@@ -656,6 +645,38 @@ class TranscriptionService:
     # -------------------------------------------------------------------------
     # Роли каналов: одно решение на звонок
     # -------------------------------------------------------------------------
+
+    async def _decide_roles(
+        self,
+        left_segments: List[dict],
+        right_segments: List[dict],
+        call_direction: str,
+    ) -> RoleDecision:
+        """
+        Конвенция onlinePBX: левый канал (0) — ИНИЦИАТОР звонка, правый (1) —
+        принявший. Проверено на реальных записях (4/4): входящий → менеджер
+        в правом канале, исходящий → в левом. Это структурный приор, он не
+        зависит от содержания и длины звонка.
+
+        Контентная эвристика может уверенно оспорить конвенцию — тогда арбитром
+        выступает LLM. Построчных правок нет: swap канала целиком или ничего.
+        """
+        prior = "left" if call_direction == "call_out" else "right"
+        heur = self._score_channels(left_segments, right_segments)
+
+        if heur.manager_channel in (None, prior):
+            source = "pbx-prior+heuristic" if heur.manager_channel == prior else "pbx-prior"
+            return RoleDecision(prior, source, False)
+
+        # Эвристика уверенно противоречит конвенции — арбитраж LLM
+        llm = await self._llm_manager_channel(left_segments, right_segments, call_direction)
+        if llm.manager_channel == prior:
+            return RoleDecision(prior, "llm+prior", False)
+        if llm.manager_channel is not None and not llm.uncertain:
+            # Оба контентных сигнала против конвенции: верим им, но помечаем
+            # неуверенность — автозаполнение по такому звонку блокируется
+            return RoleDecision(llm.manager_channel, "llm+heuristic-override", True)
+        return RoleDecision(prior, "pbx-prior-fallback", True)
 
     def _score_channels(
         self, left_segments: List[dict], right_segments: List[dict]

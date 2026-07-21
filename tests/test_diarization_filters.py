@@ -56,14 +56,68 @@ class TestSoundTag(unittest.TestCase):
     def test_sound_events_detected(self):
         self.assertTrue(svc._is_sound_tag("ТЕЛЕФОННЫЙ ЗВОНОК"))
         self.assertTrue(svc._is_sound_tag("ТРЕВОЖНАЯ МУЗЫКА"))
+        self.assertTrue(svc._is_sound_tag("Непонятный звук"))
 
     def test_abbreviations_kept(self):
         self.assertFalse(svc._is_sound_tag("ЗОИТ"))
         self.assertFalse(svc._is_sound_tag("ЕГРН"))
 
-    def test_real_speech_kept(self):
+    def test_real_caps_speech_kept(self):
+        # Whisper иногда пишет капсом РЕАЛЬНУЮ речь — блок-лист точный,
+        # правило «весь капс = не речь» удаляло живые реплики
+        self.assertFalse(svc._is_sound_tag("ДО ШЕСТИ РАБОТАЕТ. ЗАВТРА БУДЕТ."))
         self.assertFalse(svc._is_sound_tag("Это 20 соток."))
-        self.assertFalse(svc._is_sound_tag("Управление Росреестра, Александр"))
+
+
+class TestDecideRoles(unittest.IsolatedAsyncioTestCase):
+    """Конвенция АТС: левый = инициатор. call_in → менеджер справа, call_out → слева."""
+
+    NEUTRAL_L = [{"text": "Алло", "start": 0, "end": 1}]
+    NEUTRAL_R = [{"text": "Да, слушаю", "start": 1, "end": 2}]
+
+    async def test_incoming_prior_is_right(self):
+        d = await svc._decide_roles(self.NEUTRAL_L, self.NEUTRAL_R, "call_in")
+        self.assertEqual(d.manager_channel, "right")
+        self.assertFalse(d.uncertain)
+
+    async def test_outgoing_prior_is_left(self):
+        d = await svc._decide_roles(self.NEUTRAL_L, self.NEUTRAL_R, "call_out")
+        self.assertEqual(d.manager_channel, "left")
+        self.assertFalse(d.uncertain)
+
+    async def test_heuristic_agreeing_with_prior(self):
+        # Менеджерские маркеры в правом канале входящего — согласие с конвенцией
+        right = [{"text": "Мы занимаемся межеванием, будет стоить порядка 30 тысяч рублей", "start": 0, "end": 3},
+                 {"text": "Скажите адрес, посмотрю по базе, какой площади участок", "start": 4, "end": 7}]
+        left = [{"text": "Я ищу геодезию, мне нужно межевание, сколько стоит", "start": 0, "end": 3}]
+        d = await svc._decide_roles(left, right, "call_in")
+        self.assertEqual(d.manager_channel, "right")
+        self.assertEqual(d.source, "pbx-prior+heuristic")
+        self.assertFalse(d.uncertain)
+
+    async def test_heuristic_contradiction_goes_to_llm(self):
+        # Маркеры менеджера в ЛЕВОМ канале входящего — противоречие конвенции → LLM
+        left = [{"text": "Мы занимаемся межеванием, будет стоить порядка 30 тысяч рублей", "start": 0, "end": 3},
+                {"text": "Скажите адрес, посмотрю по базе, какой площади участок", "start": 4, "end": 7}]
+        right = [{"text": "Я ищу геодезию, мне нужно межевание, сколько стоит", "start": 0, "end": 3}]
+
+        from services.transcription import RoleDecision
+        called = {}
+
+        async def fake_llm(l, r, d):
+            called["yes"] = True
+            return RoleDecision("left", "llm", False)
+
+        orig = svc._llm_manager_channel
+        svc._llm_manager_channel = fake_llm
+        try:
+            d = await svc._decide_roles(left, right, "call_in")
+        finally:
+            svc._llm_manager_channel = orig
+
+        self.assertTrue(called.get("yes"))
+        self.assertEqual(d.manager_channel, "left")
+        self.assertTrue(d.uncertain)  # оба сигнала против конвенции → fail-closed
 
 
 class TestSegmentEnergy(unittest.TestCase):
