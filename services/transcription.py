@@ -146,9 +146,7 @@ class TranscriptionService:
         try:
             result = await self._whisper_with_segments(audio_data, channel_name)
             if self._fallback_until:
-                # Основной ожил после периода резерва
-                self._fallback_until = 0.0
-                logger.info("✅ Whisper снова доступен — вернулись с резерва")
+                await self._deactivate_fallback()
             return result
         except Exception as exc:
             if not (STT_FALLBACK_ENABLED and ASSEMBLYAI_API_KEY and self._is_infra_failure(exc)):
@@ -181,6 +179,19 @@ class TranscriptionService:
             )
         except Exception as tg_err:
             logger.warning(f"⚠️ Не удалось отправить алерт о переключении STT: {tg_err}")
+
+    async def _deactivate_fallback(self):
+        """Основной провайдер ожил — снимаем режим резерва и сообщаем владельцу."""
+        self._fallback_until = 0.0
+        logger.info("✅ Whisper снова доступен — вернулись с резерва")
+        try:
+            await telegram_service.send_message(
+                "✅ <b>Whisper снова работает</b>\n\n"
+                "Основной провайдер распознавания доступен — вернулись с резерва.\n"
+                "Качество расшифровок восстановлено."
+            )
+        except Exception as tg_err:
+            logger.warning(f"⚠️ Не удалось отправить уведомление о возврате STT: {tg_err}")
 
     async def _assemblyai_with_segments(
         self, audio_data: bytes, channel_name: str

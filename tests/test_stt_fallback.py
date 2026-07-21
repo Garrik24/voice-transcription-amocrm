@@ -79,14 +79,41 @@ class TestSttFallback(unittest.IsolatedAsyncioTestCase):
         whisper.assert_not_awaited()
 
     async def test_returns_to_whisper_after_window(self):
-        # Окно резерва истекло — пробуем основной снова и возвращаемся на него
+        # Окно резерва истекло — пробуем основной снова и возвращаемся на него,
+        # владельцу уходит уведомление о восстановлении
         self.svc._fallback_until = time.time() - 1
         with patch.object(self.svc, "_whisper_with_segments", new=AsyncMock(return_value=WHISPER_OUT)), \
-             patch.object(self.svc, "_assemblyai_with_segments", new=AsyncMock()) as aai:
+             patch.object(self.svc, "_assemblyai_with_segments", new=AsyncMock()) as aai, \
+             patch("services.telegram.telegram_service.send_message", new=AsyncMock()) as tg:
             result = await self.svc._stt_with_segments(b"audio", "left")
         self.assertEqual(result, WHISPER_OUT)
         aai.assert_not_awaited()
         self.assertEqual(self.svc._fallback_until, 0.0)
+        tg.assert_awaited_once()
+        self.assertIn("снова работает", tg.await_args.args[0])
+
+    async def test_no_recovery_message_when_never_switched(self):
+        # Обычная работа без сбоев — уведомлений быть не должно
+        with patch.object(self.svc, "_whisper_with_segments", new=AsyncMock(return_value=WHISPER_OUT)), \
+             patch("services.telegram.telegram_service.send_message", new=AsyncMock()) as tg:
+            await self.svc._stt_with_segments(b"audio", "left")
+        tg.assert_not_awaited()
+
+    async def test_full_cycle_switch_and_recover(self):
+        # Полный цикл: сбой → резерв → восстановление. Ровно два уведомления.
+        with patch("services.telegram.telegram_service.send_message", new=AsyncMock()) as tg:
+            with patch.object(self.svc, "_whisper_with_segments", new=AsyncMock(side_effect=_quota_error())), \
+                 patch.object(self.svc, "_assemblyai_with_segments", new=AsyncMock(return_value=AAI_OUT)):
+                await self.svc._stt_with_segments(b"audio", "left")
+            self.assertTrue(self.svc._fallback_active)
+
+            self.svc._fallback_until = time.time() - 1  # окно истекло
+            with patch.object(self.svc, "_whisper_with_segments", new=AsyncMock(return_value=WHISPER_OUT)):
+                await self.svc._stt_with_segments(b"audio", "left")
+
+        self.assertEqual(tg.await_count, 2)
+        self.assertIn("Переключение на резервный STT", tg.await_args_list[0].args[0])
+        self.assertIn("снова работает", tg.await_args_list[1].args[0])
 
     async def test_single_alert_for_both_channels(self):
         # Стерео: два канала подряд — уведомление уходит один раз
