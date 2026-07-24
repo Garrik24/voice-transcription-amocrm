@@ -804,23 +804,6 @@ async def process_call(
             await amocrm_service.add_note_to_entity(lead_id, note_text, target_entity_type)
             logger.info(f"✅ Примечание успешно добавлено к {target_entity_type}/{lead_id}")
 
-            # 7.1. Второе примечание: полная расшифровка разговора
-            minutes = int(transcription.duration_seconds // 60)
-            seconds = int(transcription.duration_seconds % 60)
-            duration_str = f"{minutes} мин {seconds} сек" if minutes else f"{seconds} сек"
-            call_type_str = "Входящий" if call_type_simple == "incoming" else "Исходящий"
-
-            full_transcript_note = (
-                "📜 ПОЛНАЯ РАСШИФРОВКА ЗВОНКА\n\n"
-                f"📞 {call_type_str} | {duration_str}\n\n"
-                f"{formatted_transcript}"
-            )
-            try:
-                await amocrm_service.add_note_to_entity(lead_id, full_transcript_note, target_entity_type)
-                logger.info(f"✅ Полная расшифровка добавлена к {target_entity_type}/{lead_id}")
-            except Exception as full_note_error:
-                # Не валим обработку: анализ уже сохранён, а полный текст можно починить отдельно
-                logger.error(f"❌ Ошибка добавления полной расшифровки к {target_entity_type}/{lead_id}: {full_note_error}")
         except Exception as note_error:
             logger.error(f"❌ Ошибка добавления примечания к {target_entity_type}/{lead_id}: {note_error}")
             # Проверяем, может быть это ID контакта, а не сделки?
@@ -1208,23 +1191,6 @@ async def process_uploaded_audio(
         await amocrm_service.add_note_to_entity(lead_id, note_text, "leads")
         logger.info(f"✅ Примечание успешно добавлено к leads/{lead_id}")
 
-        # 5.1. Второе примечание: полная расшифровка разговора
-        minutes = int(transcription.duration_seconds // 60)
-        seconds = int(transcription.duration_seconds % 60)
-        duration_str = f"{minutes} мин {seconds} сек" if minutes else f"{seconds} сек"
-        call_type_str = "Входящий" if call_type_simple == "incoming" else "Исходящий"
-
-        full_transcript_note = (
-            "📜 ПОЛНАЯ РАСШИФРОВКА ЗВОНКА\n\n"
-            f"📞 {call_type_str} | {duration_str}\n\n"
-            f"{formatted_transcript}"
-        )
-        try:
-            await amocrm_service.add_note_to_entity(lead_id, full_transcript_note, "leads")
-            logger.info(f"✅ Полная расшифровка добавлена к leads/{lead_id}")
-        except Exception as full_note_error:
-            logger.error(f"❌ Ошибка добавления полной расшифровки к leads/{lead_id}: {full_note_error}")
-        
         # 6. Отправляем красивый анализ в Telegram
         # Время: Railway работает в UTC, для Москвы всегда +3 часа.
         if call_created_at:
