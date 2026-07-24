@@ -73,9 +73,14 @@ GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "3000"))
 ANALYSIS_TEMPERATURE = float(os.getenv("ANALYSIS_TEMPERATURE", "0.1"))
 
 # Версия конвейера анализа:
-# v1 — текущий (агент анализа + валидатор пропущенных полей)
+# v1 — базовый (агент анализа + валидатор пропущенных полей)
 # v2 — усиленный (speaker stats + fact verifier)
-ANALYSIS_PIPELINE_VERSION = os.getenv("ANALYSIS_PIPELINE_VERSION", "v1").strip().lower()
+#
+# Дефолт v2 = то, что стоит в проде. Раньше здесь был v1, и расхождение
+# скрывало баги: fact verifier есть только в v2, поэтому локальный прогон
+# вёл себя иначе, чем прод (так был упущен случай, когда верификатор
+# заменял имя менеджера из CRM на заглушку).
+ANALYSIS_PIPELINE_VERSION = os.getenv("ANALYSIS_PIPELINE_VERSION", "v2").strip().lower()
 
 # Максимальная длина транскрипции для анализа (символов)
 # Если транскрипция длиннее - берём начало и конец (где обычно ключевая информация)
