@@ -30,6 +30,7 @@ from config import (
     ASSEMBLYAI_API_KEY,
     ASSEMBLYAI_SPEECH_MODEL,
     OPENAI_API_KEY,
+    STEREO_TEXT_FROM_MONO,
     STT_FALLBACK_ENABLED,
     STT_FALLBACK_RETRY_MINUTES,
 )
@@ -50,6 +51,10 @@ ENERGY_WINDOW_SEC = 0.1       # окно энергетического проф
 SEGMENT_PADDING_SEC = 0.15    # допуск на неточность таймстемпов Whisper
 NO_SPEECH_PROB_MAX = 0.6      # метрика Whisper: подозрение «речи не было»
 COMPRESSION_RATIO_MAX = 2.4   # метрика Whisper: зацикливание (повторы фраз)
+# Разница энергии каналов, ниже которой привязка сегмента к говорящему спорная
+# (перебивают друг друга). Сегмент всё равно отдаём более громкому каналу —
+# порог нужен только для диагностики в логах.
+ATTRIBUTION_MIN_DELTA_DB = 3.0
 
 # ── Маркеры ролей для детерминированного скоринга каналов ────────────────────
 # Матчатся по тексту с нормализованной пунктуацией (запятые/точки → пробел):
@@ -295,42 +300,11 @@ class TranscriptionService:
         по содержанию (эвристика → LLM-тайбрейк), а при неуверенности звонок
         помечается roles_uncertain и автозаполнение CRM блокируется.
         """
-        left_path = None
-        right_path = None
-
         try:
-            # 1. Разделяем каналы через ffmpeg
-            left_path, right_path = await self._split_channels(input_path)
-
-            # 2. Оптимизируем размер каждого канала для Whisper
-            left_data = await self._read_and_optimize(left_path)
-            right_data = await self._read_and_optimize(right_path)
-
-            logger.info(f"📊 Левый: {len(left_data)} байт, Правый: {len(right_data)} байт")
-
-            # 3. Whisper на оба канала + энергетический профиль исходника — параллельно
-            logger.info("🎙️ Транскрибируем оба канала параллельно...")
-            # Каналы транскрибируем последовательно, а не параллельно: при сбое
-            # основного провайдера первый канал переключит режим на резервный,
-            # и второй сразу пойдёт туда же — вместо двух одинаковых падений.
-            energy_task = asyncio.create_task(self._band_energy_profiles(input_path))
-            _, left_segments = await self._stt_with_segments(left_data, "left")
-            _, right_segments = await self._stt_with_segments(right_data, "right")
-            left_profile, right_profile = await energy_task
-
-            logger.info(
-                f"📝 Whisper: левый {len(left_segments)} сегм., "
-                f"правый {len(right_segments)} сегм."
-            )
-
-            # 3.5 Фильтрация галлюцинаций (по энергии) и дублей (кросс-ток, петли)
-            left_segments = self._filter_channel_segments(left_segments, left_profile, "левый")
-            right_segments = self._filter_channel_segments(right_segments, right_profile, "правый")
-            left_segments, right_segments = self._dedupe_cross_channel(
-                left_segments, right_segments, left_profile, right_profile
-            )
-            left_segments = self._dedupe_within_channel(left_segments, "левый")
-            right_segments = self._dedupe_within_channel(right_segments, "правый")
+            if STEREO_TEXT_FROM_MONO:
+                left_segments, right_segments = await self._segments_from_mono(input_path)
+            else:
+                left_segments, right_segments = await self._segments_from_channels(input_path)
 
             # 4. Решение о ролях: конвенция АТС → контентная эвристика → LLM-арбитраж
             decision = await self._decide_roles(left_segments, right_segments, call_direction)
@@ -368,10 +342,131 @@ class TranscriptionService:
                 stt_provider=self.active_provider,
             )
 
+        except Exception:
+            logger.error("❌ Стерео-транскрибация не удалась", exc_info=True)
+            raise
+
+    async def _segments_from_mono(self, input_path: str) -> Tuple[List[dict], List[dict]]:
+        """
+        Стратегия по умолчанию: текст — из моно-смеси каналов, роли — по энергии.
+
+        Зачем не по каналам: на отдельном канале тихая быстрая реплика теряет
+        разборчивость, и Whisper дописывает вместо неё слово из соседнего
+        контекста. Реальный случай — клиент говорит «Игорь, очень приятно, меня
+        Эдуард», на его канале это превратилось в «Очень приятно, я Игорь»,
+        и имя клиента пропало. В сумме каналов фраза распознаётся верно.
+
+        Роль сегмента определяем по тому, в каком канале громче речь в его
+        таймфрейме: разница на чистых репликах — десятки дБ, решение однозначное.
+        Бонус: один вызов STT вместо двух.
+        """
+        mono_path = None
+        try:
+            mono_path = await self._build_mono_mix(input_path)
+            mono_data = await self._read_and_optimize(mono_path)
+            logger.info(f"🎚️ Моно-смесь каналов: {len(mono_data)} байт")
+
+            energy_task = asyncio.create_task(self._band_energy_profiles(input_path))
+            _, segments = await self._stt_with_segments(mono_data, "mono")
+            left_profile, right_profile = await energy_task
+            logger.info(f"📝 Whisper (моно): {len(segments)} сегм.")
+
+            left_segments, right_segments = self._attribute_by_energy(
+                segments, left_profile, right_profile
+            )
+
+            # Галлюцинации отсекаем тем же энергетическим гейтом. Кросс-канальный
+            # дедуп не нужен: каждый сегмент попал ровно в один канал, дублей нет.
+            left_segments = self._filter_channel_segments(left_segments, left_profile, "левый")
+            right_segments = self._filter_channel_segments(right_segments, right_profile, "правый")
+            left_segments = self._dedupe_within_channel(left_segments, "левый")
+            right_segments = self._dedupe_within_channel(right_segments, "правый")
+            return left_segments, right_segments
         finally:
-            for path in [left_path, right_path]:
+            if mono_path and os.path.exists(mono_path):
+                os.unlink(mono_path)
+
+    async def _segments_from_channels(self, input_path: str) -> Tuple[List[dict], List[dict]]:
+        """Прежняя стратегия: Whisper отдельно на каждый канал (STEREO_TEXT_FROM_MONO=false)."""
+        left_path = right_path = None
+        try:
+            left_path, right_path = await self._split_channels(input_path)
+            left_data = await self._read_and_optimize(left_path)
+            right_data = await self._read_and_optimize(right_path)
+            logger.info(f"📊 Левый: {len(left_data)} байт, Правый: {len(right_data)} байт")
+
+            # Каналы транскрибируем последовательно, а не параллельно: при сбое
+            # основного провайдера первый канал переключит режим на резервный,
+            # и второй сразу пойдёт туда же — вместо двух одинаковых падений.
+            energy_task = asyncio.create_task(self._band_energy_profiles(input_path))
+            _, left_segments = await self._stt_with_segments(left_data, "left")
+            _, right_segments = await self._stt_with_segments(right_data, "right")
+            left_profile, right_profile = await energy_task
+            logger.info(
+                f"📝 Whisper: левый {len(left_segments)} сегм., правый {len(right_segments)} сегм."
+            )
+
+            left_segments = self._filter_channel_segments(left_segments, left_profile, "левый")
+            right_segments = self._filter_channel_segments(right_segments, right_profile, "правый")
+            left_segments, right_segments = self._dedupe_cross_channel(
+                left_segments, right_segments, left_profile, right_profile
+            )
+            left_segments = self._dedupe_within_channel(left_segments, "левый")
+            right_segments = self._dedupe_within_channel(right_segments, "правый")
+            return left_segments, right_segments
+        finally:
+            for path in (left_path, right_path):
                 if path and os.path.exists(path):
                     os.unlink(path)
+
+    def _attribute_by_energy(
+        self,
+        segments: List[dict],
+        left_profile: List[Tuple[float, float]],
+        right_profile: List[Tuple[float, float]],
+    ) -> Tuple[List[dict], List[dict]]:
+        """
+        Раздаёт сегменты моно-расшифровки по каналам: чей канал громче в
+        таймфрейме сегмента, тот и говорит.
+
+        Если профилей нет (ffmpeg не отработал), развалить диалог на реплики
+        нечем — отдаём всё в левый канал: лучше связный текст без диаризации,
+        чем пустая расшифровка.
+        """
+        if not left_profile or not right_profile:
+            logger.warning("⚠️ Нет энергопрофилей — роли по каналам не раздать, весь текст в один канал")
+            return segments, []
+
+        left_segments: List[dict] = []
+        right_segments: List[dict] = []
+        close_calls = 0
+        for seg in segments:
+            el = self._segment_energy(left_profile, seg["start"], seg["end"])
+            er = self._segment_energy(right_profile, seg["start"], seg["end"])
+            if abs(el - er) < ATTRIBUTION_MIN_DELTA_DB:
+                close_calls += 1
+            (left_segments if el >= er else right_segments).append(seg)
+
+        logger.info(
+            f"🎯 Привязка по энергии: левый {len(left_segments)}, правый {len(right_segments)}"
+            + (f", спорных (Δ<{ATTRIBUTION_MIN_DELTA_DB}dB): {close_calls}" if close_calls else "")
+        )
+        return left_segments, right_segments
+
+    async def _build_mono_mix(self, input_path: str) -> str:
+        """Сводит стерео в моно (полусумма каналов) — так тихие реплики читаются."""
+        mono_path = input_path + "_mono.mp3"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-v", "quiet", "-i", input_path,
+            "-filter_complex", "[0:a]pan=mono|c0=0.5*c0+0.5*c1[a]", "-map", "[a]",
+            mono_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not os.path.exists(mono_path):
+            raise RuntimeError(f"ffmpeg не смог свести каналы в моно: {stderr.decode()[:200]}")
+        return mono_path
 
     async def _split_channels(self, input_path: str) -> Tuple[str, str]:
         """Разделяет стерео файл на два моно MP3 через ffmpeg."""

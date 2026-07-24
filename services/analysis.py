@@ -113,15 +113,57 @@ class FieldVerification:
     evidence: List[str]
 
 
+# Значения, означающие «имя неизвестно» — их нельзя считать настоящим именем
+UNKNOWN_NAME_VALUES = {
+    "не представился", "не указано", "не определено", "неизвестно",
+    "менеджер", "клиент", "",
+}
+
+
+def _is_real_name(value: Optional[str]) -> bool:
+    """True, если строка похожа на настоящее имя, а не на заглушку."""
+    if not value:
+        return False
+    v = value.strip()
+    if v.lower() in UNKNOWN_NAME_VALUES:
+        return False
+    # «Менеджер #2629318» — техническая заглушка, когда имя не подтянулось из CRM
+    return not re.match(r"^Менеджер\s*#\d+$", v, re.IGNORECASE)
+
+
+def _resolve_manager_name(from_crm: str, from_llm: Optional[str]) -> str:
+    """
+    Выбирает имя менеджера. Приоритет — у CRM: оно приходит из
+    responsible_user_id и не зависит от качества расшифровки.
+    Модель используется как запасной вариант, если CRM имени не дала.
+    """
+    if _is_real_name(from_crm):
+        return from_crm.strip()
+    if _is_real_name(from_llm):
+        return from_llm.strip()
+    return from_crm or "Менеджер"
+
+
 # Системный промпт для анализа (Агент 1)
 ANALYSIS_SYSTEM_PROMPT = """Ты — ассистент для анализа телефонных разговоров геодезической компании.
 Твоя задача — извлечь только факты из транскрибации и вернуть строго JSON.
 
-1. Определение ролей
-- Менеджер компании — спикер с именем {manager_name}. Всё, что он говорит — позиция компании.
+1. Определение ролей и имён
+- Метки [Менеджер] / [Клиент] проставлены по каналам записи (у каждого свой канал) — доверяй им.
+- Менеджер компании — {manager_name}. Всё, что он говорит — позиция компании.
 - Все остальные спикеры — клиенты.
-- Если имя клиента не прозвучало — "client_name": "Не представился".
-- Если менеджер обращается к клиенту по имени — это имя клиента.
+
+Имя менеджера ("manager_name"):
+- ВСЕГДА возвращай ровно "{manager_name}" — это имя уже известно из CRM и оно достоверно.
+- НЕ заменяй его и НЕ пиши "Не представился", даже если менеджер в разговоре не назвался.
+
+Имя клиента ("client_name") — ищи в репликах [Клиент]:
+- прямое представление: «меня зовут X», «я X», «это X», «X беспокоит»;
+- менеджер обращается к клиенту по имени.
+- Имя клиента может СОВПАДАТЬ с именем менеджера — тёзки встречаются. Если клиент
+  назвал имя, совпадающее с {manager_name}, всё равно запиши его в "client_name",
+  а не считай это ошибкой разметки.
+- Только если имя клиента действительно нигде не прозвучало — "client_name": "Не представился".
 
 2. Инструкции по чтению транскрибации
 - Читай ВСЮ транскрибацию от начала до конца. Не пропускай фрагменты.
@@ -601,8 +643,22 @@ class AnalysisService:
                 for field in VERIFY_FIELDS
             }
 
-    def _apply_verification(self, analysis: CallAnalysis, checks: Dict[str, FieldVerification]) -> CallAnalysis:
+    def _apply_verification(
+        self,
+        analysis: CallAnalysis,
+        checks: Dict[str, FieldVerification],
+        protected: frozenset = frozenset(),
+    ) -> CallAnalysis:
+        """
+        Применяет вердикты верификатора. Поля из `protected` не трогаются:
+        они получены не из расшифровки, а из достоверного источника (CRM),
+        поэтому «проверка по тексту разговора» для них бессмысленна — менеджер
+        может ни разу не назвать своё имя, и верификатор заменит его заглушкой.
+        """
         for field, check in checks.items():
+            if field in protected:
+                logger.info(f"v2 verify: поле {field} защищено (значение из CRM), вердикт не применяем")
+                continue
             logger.info(
                 "v2 verify field=%s status=%s confidence=%.2f suggested_fix=%s evidence=%s",
                 field,
@@ -818,10 +874,19 @@ class AnalysisService:
             if not isinstance(next_steps, list):
                 next_steps = []
 
+            # Имя менеджера известно из CRM (responsible_user_id → имя пользователя) —
+            # это достоверный источник. LLM регулярно возвращает "Не представился",
+            # даже когда имя звучит в разговоре, и затирает им хорошее значение.
+            # Поэтому берём имя модели ТОЛЬКО если CRM его не дала (осталась заглушка).
+            resolved_manager = _resolve_manager_name(
+                from_crm=manager_name,
+                from_llm=result_json.get("manager_name"),
+            )
+
             # Создаём объект результата (Агент 1)
             analysis = CallAnalysis(
                 client_name=result_json.get("client_name", "Клиент"),
-                manager_name=result_json.get("manager_name", manager_name),
+                manager_name=resolved_manager,
                 summary=result_json.get("summary", ""),
                 client_city=result_json.get("client_city", "Не указано"),
                 work_type=result_json.get("work_type", "Консультация"),
@@ -859,7 +924,9 @@ class AnalysisService:
             if ANALYSIS_PIPELINE_VERSION == "v2":
                 logger.info("🚀 ANALYSIS_PIPELINE_VERSION=v2, запускаем fact verifier (Агент 3)")
                 checks = await self._verify_with_claude(validated_analysis, transcript, speaker_stats)
-                validated_analysis = self._apply_verification(validated_analysis, checks)
+                # Имя менеджера пришло из CRM — верификатор не должен его «исправлять»
+                protected = frozenset({"manager_name"}) if _is_real_name(manager_name) else frozenset()
+                validated_analysis = self._apply_verification(validated_analysis, checks, protected)
                 logger.info("✅ Агент 3 (fact verifier через Claude) завершил работу")
             else:
                 logger.info("ℹ️ ANALYSIS_PIPELINE_VERSION=v1, fact verifier отключен")
