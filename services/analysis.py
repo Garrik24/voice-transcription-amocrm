@@ -373,6 +373,15 @@ FACT_VERIFIER_SYSTEM_PROMPT = """Ты — аудитор фактов по тр�
 - suggested_fix: безопасная замена, если поле не подтверждено.
 - evidence: 1-3 коротких точных фрагмента из транскрибации (только текст, без комментариев).
 - Не выдумывай. Если данных нет, предложи безопасное значение.
+- ОСОБОЕ ПРАВИЛО для пустых полей ("Не указано"/"Не обсуждали"/"Не определено"):
+  если информация для такого поля в транскрибации ЕСТЬ — верни status "contradicted",
+  а в suggested_fix положи НАЙДЕННОЕ значение (кратко), с evidence.
+  Ищи синонимы и косвенные упоминания:
+  * город: "я из Краснодара", "участок в Ростове", "живу в пригороде"
+  * стоимость: "25 тысяч", "около 30 000", "цена будет 40 тысяч рублей"
+  * оплата: "50 на 50", "половину сейчас", "предоплата 50%", "100% после"
+  * дата: "перезвоню в среду", "15 января", "завтра позвоню", "через неделю"
+  Если информации действительно нет — пустое значение корректно, status "supported".
 
 Безопасные значения:
 - city/date -> "Не указано"
@@ -896,14 +905,17 @@ class AnalysisService:
 
             logger.info("✅ Агент 1 (анализ через Claude) завершил работу")
 
-            # Запускаем валидатор (Агент 2)
-            validated_analysis = await self._validate_and_fix(
-                analysis,
-                transcript,  # Используем оригинальную транскрипцию
-                manager_name
-            )
-
-            logger.info("✅ Агент 2 (валидация через Claude) завершил работу")
+            if ANALYSIS_PIPELINE_VERSION == "v3":
+                # v3: задача валидатора слита в промпт fact verifier — один вызов вместо двух
+                validated_analysis = analysis
+            else:
+                # Запускаем валидатор (Агент 2)
+                validated_analysis = await self._validate_and_fix(
+                    analysis,
+                    transcript,  # Используем оригинальную транскрипцию
+                    manager_name
+                )
+                logger.info("✅ Агент 2 (валидация через Claude) завершил работу")
 
             # v2: детерминированные метрики спикеров + верификация фактов.
             speaker_stats = self._build_speaker_stats(speakers)
@@ -917,15 +929,15 @@ class AnalysisService:
                 speaker_stats.suspicious_reason,
             )
 
-            if ANALYSIS_PIPELINE_VERSION == "v2":
-                logger.info("🚀 ANALYSIS_PIPELINE_VERSION=v2, запускаем fact verifier (Агент 3)")
+            if ANALYSIS_PIPELINE_VERSION in ("v2", "v3"):
+                logger.info(f"🚀 ANALYSIS_PIPELINE_VERSION={ANALYSIS_PIPELINE_VERSION}, запускаем fact verifier")
                 checks = await self._verify_with_claude(validated_analysis, transcript, speaker_stats)
                 # Имя менеджера пришло из CRM — верификатор не должен его «исправлять»
                 protected = frozenset({"manager_name"}) if _is_real_name(manager_name) else frozenset()
                 validated_analysis = self._apply_verification(validated_analysis, checks, protected)
                 logger.info("✅ Агент 3 (fact verifier через Claude) завершил работу")
             else:
-                logger.info("ℹ️ ANALYSIS_PIPELINE_VERSION=v1, fact verifier отключен")
+                logger.info(f"ℹ️ ANALYSIS_PIPELINE_VERSION={ANALYSIS_PIPELINE_VERSION}, fact verifier отключен")
 
             return validated_analysis
 
