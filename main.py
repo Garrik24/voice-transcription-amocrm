@@ -243,7 +243,14 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str,
         # по тегам сделки, для чатов без тегов — фолбэк по каналу (source_fallback_name)
         if 212063 not in existing_fields:
             tags = lead_data.get("_embedded", {}).get("tags", [])
-            source_name = _match_tag_to_source(tags) if tags else None
+            # Метка линии из названия «Входящий +7… (9383527800 - 2ГИС)» надёжнее тегов:
+            # тег «Авито» интеграция вешает на все звонковые сделки без разбора
+            source_name = None
+            m = re.search(r"\(\s*\d+\s*-\s*([^)]+)\)", lead_data.get("name") or "")
+            if m:
+                source_name = _match_tag_to_source([{"name": m.group(1).strip()}])
+            if not source_name and tags:
+                source_name = _match_tag_to_source(tags)
             if not source_name and source_fallback_name:
                 source_name = source_fallback_name
             if source_name:
