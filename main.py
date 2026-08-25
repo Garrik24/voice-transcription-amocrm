@@ -311,10 +311,16 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
             location = getattr(analysis, "location", "")
             if work_type and work_type.lower() not in ("не определено", "не обсуждали", ""):
                 short_name = _shorten_work_type(work_type)
-                if location and location.lower() not in ("не указано", "не определено", ""):
-                    name_to_set = f"{short_name} {location}"
-                else:
-                    name_to_set = short_name
+                # Привязка, чтобы «МП» не плодились неотличимыми: адрес → город → имя клиента
+                empty = ("не указано", "не определено", "не обсуждали", "")
+                city = getattr(analysis, "client_city", "") or ""
+                client = _clean_client_name(getattr(analysis, "client_name", "")) or ""
+                anchor = next(
+                    (v.strip() for v in (location, city, client)
+                     if v and v.strip() and v.lower() not in empty),
+                    None,
+                )
+                name_to_set = f"{short_name} {anchor}"[:80] if anchor else short_name
                 logger.info(f"  🏷️ Название сделки: {name_to_set}")
 
         # Отправляем PATCH если есть что обновлять
