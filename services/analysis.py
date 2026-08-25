@@ -358,6 +358,41 @@ FIELD_DEFAULTS: Dict[str, Any] = {
     "next_steps": [],
 }
 
+CHAT_ANALYSIS_SYSTEM_PROMPT = """Ты — аналитик переписки геодезической компании «Ставропольгеодезия» с клиентами в мессенджерах (WhatsApp, Авито и др.).
+
+На входе — хронология диалога. Реплики размечены: «Клиент» и «Менеджер».
+Строки вида [голосовое: ...] — расшифровка голосового сообщения, [файл: имя] и [фото] — вложения
+(имена файлов информативны: «Решение суда.pdf» говорит о наличии решения суда).
+
+Извлеки информацию для CRM. Правила:
+- НЕ выдумывай. Нет информации — пиши "Не указано" (для стоимости/оплаты — "Не обсуждали").
+- work_type — тип работ: Межевание, Техплан, Топосъёмка, Вынос границ, Акт обследования и т.п.;
+  не попадает в известные типы → "Прочие"; неясно → "Не определено".
+- location — адрес/населённый пункт ОБЪЕКТА работ, кратко (2-4 слова). Если конкретного адреса нет,
+  но назван населённый пункт — укажи его.
+- client_city — город/населённый пункт клиента.
+- cost — стоимость, если называлась. payment_terms — условия оплаты.
+- call_result — итог диалога: Согласие / Думает / Перезвонить / Отказ / Не определено.
+- next_contact_date — когда договорились связаться (словами, как в диалоге: "завтра", "пятница").
+- next_steps — до 5 конкретных шагов. Шаги менеджера начинай с "Менеджеру: ".
+- summary — суть диалога, 2-4 предложения.
+- client_name — имя клиента, если видно из диалога/подписи; иначе "Клиент".
+
+Верни ТОЛЬКО валидный JSON:
+{
+  "client_name": "string",
+  "summary": "string",
+  "client_city": "string",
+  "work_type": "string",
+  "location": "string",
+  "cost": "string",
+  "payment_terms": "string",
+  "call_result": "string",
+  "next_contact_date": "string",
+  "next_steps": ["string"]
+}"""
+
+
 FACT_VERIFIER_SYSTEM_PROMPT = """Ты — аудитор фактов по транскрибации звонка.
 
 Твоя задача:
@@ -649,6 +684,36 @@ class AnalysisService:
                 )
                 for field in VERIFY_FIELDS
             }
+
+    async def analyze_chat(self, dialog_text: str, channel_name: str = "чат") -> CallAnalysis:
+        """
+        Анализ переписки в мессенджере → тот же CallAnalysis, что и для звонков,
+        поэтому дальше работают общие auto_fill_lead_fields и авто-задача.
+        Один вызов Claude, без валидатора/верификатора: текст диалога точен,
+        в отличие от расшифровки звука.
+        """
+        result_text = await self._call_claude(
+            system_prompt=CHAT_ANALYSIS_SYSTEM_PROMPT,
+            user_prompt=f"Канал: {channel_name}\n\nПЕРЕПИСКА:\n{dialog_text}",
+            max_tokens=1500,
+        )
+        data = _extract_json_from_text(result_text)
+        next_steps = data.get("next_steps") or []
+        if not isinstance(next_steps, list):
+            next_steps = _normalize_list_field(next_steps)
+        return CallAnalysis(
+            client_name=data.get("client_name", "Клиент"),
+            manager_name="Менеджер",
+            summary=data.get("summary", ""),
+            client_city=data.get("client_city", "Не указано"),
+            work_type=data.get("work_type", "Не определено"),
+            location=data.get("location", "Не указано"),
+            cost=data.get("cost", "Не обсуждали"),
+            payment_terms=data.get("payment_terms", "Не обсуждали"),
+            call_result=data.get("call_result", "Не определено"),
+            next_contact_date=data.get("next_contact_date", "Не указано"),
+            next_steps=[str(x).strip() for x in next_steps if str(x).strip()][:5],
+        )
 
     def _apply_verification(
         self,

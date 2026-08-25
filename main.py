@@ -7,6 +7,8 @@ FastAPI сервер с webhook endpoint для AmoCRM.
 """
 import logging
 import asyncio
+import json
+import httpx
 import os
 import re
 import shutil
@@ -212,7 +214,8 @@ def _has_custom_field_value(custom_field: dict) -> bool:
     return False
 
 
-async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
+async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str,
+                                source_fallback_name: str | None = None):
     """
     Автоматически заполняет поля сделки на основе AI-анализа звонка.
     Заполняет ТОЛЬКО пустые поля — не перезаписывает то, что менеджер уже заполнил.
@@ -236,20 +239,22 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
         custom_fields = []
         price_to_set = None
 
-        # 0. Источник по тегам (field_id=212063, select; enum_id резолвится по имени)
+        # 0. Источник (field_id=212063, select; enum_id резолвится по имени):
+        # по тегам сделки, для чатов без тегов — фолбэк по каналу (source_fallback_name)
         if 212063 not in existing_fields:
             tags = lead_data.get("_embedded", {}).get("tags", [])
-            if tags:
-                source_name = _match_tag_to_source(tags)
-                if source_name:
-                    enum_id = await amocrm_service.resolve_enum_id(212063, source_name)
-                    if enum_id:
-                        custom_fields.append({
-                            "field_id": 212063,
-                            "values": [{"enum_id": enum_id}]
-                        })
-                        tag_names = ", ".join(t.get("name", "") for t in tags)
-                        logger.info(f"  📢 Источник (по тегам [{tag_names}]): {source_name} → enum_id={enum_id}")
+            source_name = _match_tag_to_source(tags) if tags else None
+            if not source_name and source_fallback_name:
+                source_name = source_fallback_name
+            if source_name:
+                enum_id = await amocrm_service.resolve_enum_id(212063, source_name)
+                if enum_id:
+                    custom_fields.append({
+                        "field_id": 212063,
+                        "values": [{"enum_id": enum_id}]
+                    })
+                    tag_names = ", ".join(t.get("name", "") for t in tags)
+                    logger.info(f"  📢 Источник (теги [{tag_names}] / канал): {source_name} → enum_id={enum_id}")
 
         # 1. Город (field_id=212029, text)
         if 212029 not in existing_fields:
@@ -984,6 +989,178 @@ async def _reconcile_once():
                 logger.error(f"❌ Reconcile: ошибка дообработки note {note.get('id')}: {e}")
 
 
+# ============== Автозаполнение из чат-переписки (Авито / WhatsApp / прочие каналы) ==============
+# Переписка сделок хранится на mcp-amocrm-server (вебхук add_message → БД на томе Railway).
+# Когда диалог затихает, прогоняем его через AI-анализ: та же карточка, та же задача, что и для звонков.
+CHAT_ANALYSIS_ENABLED = os.getenv("CHAT_ANALYSIS_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+CHAT_STORAGE_URL = os.getenv("CHAT_STORAGE_URL", "https://mcp-amocrm-server-production.up.railway.app").rstrip("/")
+CHAT_QUIET_SECONDS = int(os.getenv("CHAT_QUIET_SECONDS", "1800"))   # диалог «затих» спустя, сек
+CHAT_VOICE_TRANSCRIBE = os.getenv("CHAT_VOICE_TRANSCRIBE", "true").strip().lower() in ("1", "true", "yes")
+
+_CHAT_ANALYZED: dict = {}       # lead_id -> ts, до которого переписка проанализирована
+_CHAT_VOICE_CACHE: dict = {}    # message_id -> текст расшифровки голосового
+CHAT_NOTE_MARKER = "АНАЛИЗ ПЕРЕПИСКИ"
+
+# origin канала → имя значения поля «Источник» (только однозначные)
+CHAT_ORIGIN_TO_SOURCE = {
+    "avito": "Авито",
+    "wappi": "WhatsApp",
+    "whatsapp": "WhatsApp",
+}
+
+
+def _chat_origin_label(origin: str) -> str:
+    o = (origin or "").lower()
+    if "avito" in o:
+        return "Авито"
+    if "wappi" in o or "whatsapp" in o:
+        return "WhatsApp"
+    return origin or "чат"
+
+
+def _chat_source_name(origin: str) -> str | None:
+    o = (origin or "").lower()
+    for key, name in CHAT_ORIGIN_TO_SOURCE.items():
+        if key in o:
+            return name
+    return None
+
+
+async def _fetch_chat_json(path: str) -> dict:
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(f"{CHAT_STORAGE_URL}{path}")
+        response.raise_for_status()
+        return response.json()
+
+
+async def _transcribe_chat_voice(msg: dict) -> str:
+    """Расшифровка голосового из чата (кэш по message_id; ошибки не фатальны)."""
+    mid = msg.get("message_id") or str(msg.get("id"))
+    if mid in _CHAT_VOICE_CACHE:
+        return _CHAT_VOICE_CACHE[mid]
+    text = "[голосовое сообщение]"
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            response = await client.get(msg["media_url"])
+            response.raise_for_status()
+            audio = response.content
+        if len(audio) > 1000:
+            tr = await transcription_service.transcribe_audio(audio, speaker_labels=False)
+            if (tr.full_text or "").strip():
+                text = f"[голосовое: {tr.full_text.strip()}]"
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось расшифровать голосовое из чата ({mid}): {e}")
+    if len(_CHAT_VOICE_CACHE) > 500:
+        _CHAT_VOICE_CACHE.clear()
+    _CHAT_VOICE_CACHE[mid] = text
+    return text
+
+
+def _chat_attachment_line(msg: dict) -> str:
+    """Маркер вложения; имя файла берём из raw_payload — оно информативно."""
+    mtype = msg.get("media_type")
+    fname = ""
+    try:
+        fname = (json.loads(msg.get("raw_payload") or "{}").get("attachment") or {}).get("file_name") or ""
+    except Exception:
+        pass
+    if mtype == "picture":
+        return "[фото]"
+    if mtype == "file":
+        return f"[файл: {fname}]" if fname else "[файл]"
+    return f"[вложение: {mtype}]"
+
+
+async def _build_chat_dialog(messages: list) -> tuple[str, int]:
+    """Хронологичный текст диалога. Возвращает (текст, число содержательных реплик)."""
+    lines, meaningful = [], 0
+    msgs = sorted(messages, key=lambda m: m.get("created_at") or 0)
+    voice_budget = 8  # не расшифровываем больше N голосовых за один анализ
+    for m in msgs:
+        role = "Клиент" if m.get("is_incoming") else "Менеджер"
+        when = datetime.fromtimestamp(m.get("created_at") or 0, _MSK_TZ).strftime("%d.%m %H:%M")
+        text = (m.get("text") or "").strip()
+        if not text and m.get("media_type") == "voice" and m.get("media_url"):
+            if CHAT_VOICE_TRANSCRIBE and voice_budget > 0:
+                voice_budget -= 1
+                text = await _transcribe_chat_voice(m)
+            else:
+                text = "[голосовое сообщение]"
+        elif not text and m.get("media_type"):
+            text = _chat_attachment_line(m)
+        if not text:
+            continue
+        if not text.startswith("[") or "голосовое:" in text or "файл:" in text:
+            meaningful += 1
+        lines.append(f"[{when}] {role}: {text}")
+    return "\n".join(lines), meaningful
+
+
+async def _chat_autofill_pass(now: int):
+    """Затихшие диалоги с новыми входящими → анализ → поля + задача + примечание."""
+    data = await _fetch_chat_json("/api/chat/recent?limit=100")
+    by_lead: dict = {}
+    for m in data.get("messages", []):
+        lid = m.get("lead_id")
+        if lid:
+            by_lead.setdefault(int(lid), []).append(m)
+
+    for lead_id, msgs in by_lead.items():
+        last_ts = max(m.get("created_at") or 0 for m in msgs)
+        if now - last_ts < CHAT_QUIET_SECONDS:
+            continue  # диалог ещё активен — ждём затишья
+        analyzed_to = _CHAT_ANALYZED.get(lead_id, 0)
+        if analyzed_to == 0:
+            # CRM-guard после рестарта: наша нота новее последнего сообщения?
+            notes = await amocrm_service.get_recent_notes("leads", lead_id, limit=15)
+            marks = [n.get("created_at", 0) for n in notes
+                     if CHAT_NOTE_MARKER in ((n.get("params") or {}).get("text") or "")]
+            if marks:
+                analyzed_to = max(marks)
+                _CHAT_ANALYZED[lead_id] = analyzed_to
+        if not any((m.get("is_incoming") and (m.get("created_at") or 0) > analyzed_to) for m in msgs):
+            continue  # новых входящих нет — рассылки/исходящие анализ не триггерят
+
+        full = await _fetch_chat_json(f"/api/chat/lead/{lead_id}?limit=100")
+        dialog, meaningful = await _build_chat_dialog(full.get("messages", []))
+        if meaningful < 2:
+            _CHAT_ANALYZED[lead_id] = last_ts
+            continue
+
+        origin = (msgs[0].get("origin") or "")
+        channel = _chat_origin_label(origin)
+        logger.info(f"💬 Анализ переписки [{channel}] по сделке #{lead_id} ({meaningful} реплик)")
+        try:
+            analysis = await analysis_service.analyze_chat(dialog, channel_name=channel)
+        except Exception as e:
+            logger.error(f"❌ Ошибка анализа переписки #{lead_id}: {e}")
+            continue
+
+        lead_data = await amocrm_service.get_lead(lead_id)
+        responsible = (lead_data or {}).get("responsible_user_id")
+
+        await auto_fill_lead_fields(
+            lead_id, analysis, "incoming",
+            source_fallback_name=_chat_source_name(origin),
+        )
+        await _update_contact_name_from_analysis(analysis, "leads", lead_id, lead_id)
+        if AUTO_TASK_ENABLED:
+            await _create_followup_task(lead_id, analysis, responsible)
+
+        note_lines = [f"💬 {CHAT_NOTE_MARKER} (AI) [{channel}]", ""]
+        if analysis.summary:
+            note_lines += [analysis.summary, ""]
+        note_lines.append(f" Работа: {analysis.work_type} |  Город: {analysis.client_city}")
+        note_lines.append(f" Стоимость: {analysis.cost} |  Оплата: {analysis.payment_terms}")
+        note_lines.append(f" Итог: {analysis.call_result} |  След. контакт: {analysis.next_contact_date}")
+        if analysis.next_steps:
+            note_lines += ["", "✅ Следующие шаги:"] + [f"- {s}" for s in analysis.next_steps]
+        await amocrm_service.add_note_to_entity(lead_id, "\n".join(note_lines), "leads")
+
+        _CHAT_ANALYZED[lead_id] = last_ts
+        logger.info(f"✅ Переписка #{lead_id} проанализирована (до {datetime.fromtimestamp(last_ts, _MSK_TZ):%d.%m %H:%M})")
+
+
 async def _reconcile_loop():
     logger.info(
         f"🩹 Догоняющий цикл включён: каждые {RECONCILE_INTERVAL}с, "
@@ -995,6 +1172,11 @@ async def _reconcile_loop():
             await _reconcile_once()
         except Exception as e:
             logger.error(f"❌ Ошибка догоняющего цикла: {e}")
+        if CHAT_ANALYSIS_ENABLED:
+            try:
+                await _chat_autofill_pass(int(time.time()))
+            except Exception as e:
+                logger.error(f"❌ Ошибка чат-прохода: {e}")
 
 
 @asynccontextmanager
