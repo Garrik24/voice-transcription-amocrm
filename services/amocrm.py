@@ -106,7 +106,7 @@ class AmoCRMService:
                     headers=self.headers,
                     params={
                         "filter[note_type][0]": "common",
-                        "order[created_at]": "desc",
+                        "order[id]": "desc",  # order[created_at] на notes игнорируется amoCRM
                         "limit": 100,
                     },
                 )
@@ -280,9 +280,9 @@ class AmoCRMService:
                 response = await client.get(
                     url,
                     headers=self.headers,
-                    # desc обязателен: без него amoCRM отдаёт СТАРЕЙШИЕ ноты,
-                    # и «последние примечания» — вовсе не последние
-                    params={"limit": limit, "order[created_at]": "desc"}
+                    # order[id]=desc обязателен: order[created_at] на notes-эндпоинте
+                    # amoCRM МОЛЧА игнорирует и отдаёт старейшие ноты
+                    params={"limit": limit, "order[id]": "desc"}
                 )
                 
                 if response.status_code == 204:

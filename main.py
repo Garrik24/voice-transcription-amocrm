@@ -1147,7 +1147,8 @@ async def _chat_autofill_pass(now: int):
         if AUTO_TASK_ENABLED:
             await _create_followup_task(lead_id, analysis, responsible)
 
-        note_lines = [f"💬 {CHAT_NOTE_MARKER} (AI) [{channel}]", ""]
+        # ✉ — BMP-символ: 4-байтные эмодзи (💬) amoCRM молча вырезает из нот
+        note_lines = [f"✉ {CHAT_NOTE_MARKER} (AI) [{channel}]", ""]
         if analysis.summary:
             note_lines += [analysis.summary, ""]
         note_lines.append(f" Работа: {analysis.work_type} |  Город: {analysis.client_city}")
