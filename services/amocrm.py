@@ -280,7 +280,9 @@ class AmoCRMService:
                 response = await client.get(
                     url,
                     headers=self.headers,
-                    params={"limit": limit}
+                    # desc обязателен: без него amoCRM отдаёт СТАРЕЙШИЕ ноты,
+                    # и «последние примечания» — вовсе не последние
+                    params={"limit": limit, "order[created_at]": "desc"}
                 )
                 
                 if response.status_code == 204:
