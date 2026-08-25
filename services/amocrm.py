@@ -3,6 +3,7 @@
 Получение данных о звонках и сохранение примечаний.
 """
 import asyncio
+import time
 import httpx
 import ssl
 import logging
@@ -22,7 +23,107 @@ class AmoCRMService:
             "Authorization": f"Bearer {AMOCRM_ACCESS_TOKEN}",
             "Content-Type": "application/json"
         }
+        # Кэш enum-значений select-полей: field_id -> ({value_lower: enum_id}, valid_until)
+        self._enum_cache: Dict[int, tuple] = {}
     
+    async def resolve_enum_id(self, field_id: int, value_name: str, ttl: int = 3600) -> Optional[int]:
+        """
+        enum_id значения select-поля сделки по ИМЕНИ (case-insensitive), кэш на ttl.
+
+        Хардкод enum_id уже приводил к инциденту: поле Источник пересоздали,
+        все зашитые id умерли, и PATCH получал 400. Резолв по имени переживает
+        пересоздание поля; при недоступности API используется последний кэш.
+        """
+        if not value_name:
+            return None
+        now = time.time()
+        cached = self._enum_cache.get(field_id)
+        mapping = None
+        if not cached or cached[1] < now:
+            try:
+                async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+                    response = await client.get(
+                        f"{self.base_url}/leads/custom_fields/{field_id}",
+                        headers=self.headers,
+                    )
+                    response.raise_for_status()
+                    enums = response.json().get("enums") or []
+                mapping = {str(e["value"]).strip().lower(): int(e["id"]) for e in enums}
+                self._enum_cache[field_id] = (mapping, now + ttl)
+            except Exception as e:
+                logger.warning(f"⚠️ resolve_enum_id: не смог обновить enums поля {field_id}: {e}")
+                if cached:
+                    mapping = cached[0]  # протухший кэш лучше, чем ничего
+        else:
+            mapping = cached[0]
+        if mapping is None:
+            return None
+        enum_id = mapping.get(value_name.strip().lower())
+        if enum_id is None:
+            logger.warning(f"⚠️ Значение '{value_name}' не найдено среди enums поля {field_id}")
+        return enum_id
+
+    async def list_call_events(self, from_ts: int, limit: int = 100) -> list:
+        """События звонков (incoming_call/outgoing_call) начиная с from_ts."""
+        try:
+            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+                response = await client.get(
+                    f"{self.base_url}/events",
+                    headers=self.headers,
+                    params={
+                        "filter[type][0]": "incoming_call",
+                        "filter[type][1]": "outgoing_call",
+                        "filter[created_at][from]": from_ts,
+                        "limit": limit,
+                    },
+                )
+                if response.status_code == 204:
+                    return []
+                response.raise_for_status()
+                events = response.json().get("_embedded", {}).get("events", [])
+        except Exception as e:
+            logger.warning(f"⚠️ list_call_events: {e}")
+            return []
+        out = []
+        for e in events:
+            try:
+                out.append({
+                    "entity_type": "leads" if e["entity_type"] == "lead" else "contacts",
+                    "entity_id": int(e["entity_id"]),
+                    "note_id": int(e["value_after"][0]["note"]["id"]),
+                    "created_at": int(e["created_at"]),
+                })
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+        return out
+
+    async def list_analysis_note_times(self, lead_id: int, since_ts: int) -> list:
+        """created_at примечаний «АНАЛИЗ ЗВОНКА» сделки начиная с since_ts, по возрастанию."""
+        try:
+            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+                response = await client.get(
+                    f"{self.base_url}/leads/{lead_id}/notes",
+                    headers=self.headers,
+                    params={
+                        "filter[note_type][0]": "common",
+                        "order[created_at]": "desc",
+                        "limit": 100,
+                    },
+                )
+                if response.status_code == 204:
+                    return []
+                response.raise_for_status()
+                notes = response.json().get("_embedded", {}).get("notes", [])
+        except Exception as e:
+            logger.warning(f"⚠️ list_analysis_note_times({lead_id}): {e}")
+            return []
+        times = [
+            n.get("created_at", 0) for n in notes
+            if "АНАЛИЗ ЗВОНКА" in ((n.get("params") or {}).get("text") or "")
+            and n.get("created_at", 0) >= since_ts
+        ]
+        return sorted(times)
+
     async def get_recent_calls(self, minutes: int = 10) -> list:
         """
         Получает список недавних звонков из AmoCRM.

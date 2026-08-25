@@ -7,6 +7,7 @@ FastAPI сервер с webhook endpoint для AmoCRM.
 """
 import logging
 import asyncio
+import os
 import re
 import shutil
 import time
@@ -23,84 +24,85 @@ from services.analysis import analysis_service
 from services.telegram import telegram_service
 from services import alerts
 
-# ============== Маппинг work_type → enum_id для поля "Интерес" (field_id=212083) ==============
-WORK_TYPE_ENUM_MAP = {
-    "межевание": 423475,
-    "вынос": 423477,
-    "вынос в натуру": 423477,
-    "вынос границ": 423477,
-    "топосъёмка": 423479,
-    "топосъемка": 423479,
-    "топографическая съёмка": 423479,
-    "топографическая съемка": 423479,
-    "техплан": 423495,
-    "технический план": 423495,
-    "техпаспорт": 1265209,
-    "технический паспорт": 1265209,
-    "акт обследования": 1276685,
-    "схема": 423483,
-    "схема на кпт": 423483,
-    "геодезическое сопровождение": 1329477,
-    "геодезия": 1329477,
-    "раздел": 423507,
-    "раздел зу": 423507,
-    "разбивка": 423505,
-    "исполнительная съемка": 1276379,
-    "исполнительная съёмка": 1276379,
-    "проектирование": 423491,
-    "геология": 423493,
-    "экология": 423497,
-    "подбор зу": 1342589,
-    "межевание и тех план": 1344645,
-    "межевание и техплан": 1344645,
-    "прочие": 1324619,
-    "подача в рр через лк": 1344085,
-    "все виды изысканий": 1314061,
-    "снижение кс": 423489,
-    "ппт": 423481,
-    "гидрометеорология": 423499,
-    "водоохранная зона": 423509,
+# ============== Маппинг work_type → ИМЯ значения поля "Интерес" (field_id=212083) ==============
+# enum_id резолвится по имени через amocrm_service.resolve_enum_id — хардкод id
+# уже приводил к инциденту (пересоздание поля Источник). Имена сверены с CRM 25.08.2026.
+WORK_TYPE_TO_INTEREST_NAME = {
+    "межевание": "Межевание",
+    "вынос": "Выносв натуру",
+    "вынос в натуру": "Выносв натуру",
+    "вынос границ": "Выносв натуру",
+    "топосъёмка": "Топосъёмка",
+    "топосъемка": "Топосъёмка",
+    "топографическая съёмка": "Топосъёмка",
+    "топографическая съемка": "Топосъёмка",
+    "техплан": "Техплан",
+    "технический план": "Техплан",
+    "техпаспорт": "Техпаспорт",
+    "технический паспорт": "Техпаспорт",
+    "акт обследования": "Акт обследования",
+    "схема": "Схема на КПТ",
+    "схема на кпт": "Схема на КПТ",
+    "геодезическое сопровождение": "геодезическое сопровождение",
+    "геодезия": "геодезическое сопровождение",
+    "раздел": "Раздел ЗУ",
+    "раздел зу": "Раздел ЗУ",
+    "разбивка": "Разбивка",
+    "исполнительная съемка": "Исполнительная съемка",
+    "исполнительная съёмка": "Исполнительная съемка",
+    "проектирование": "Проектирование",
+    "геология": "Геология",
+    "экология": "Экология",
+    "подбор зу": "Подбор ЗУ",
+    "межевание и тех план": "межевание и тех план",
+    "межевание и техплан": "межевание и тех план",
+    "прочие": "Прочие",
+    "подача в рр через лк": "Подача в РР через ЛК",
+    "все виды изысканий": "Все виды изысканий",
+    "инженерные изыскания": "Все виды изысканий",
+    "снижение кс": "Снижение КС",
+    "ппт": "ППТ (ПМТ)",
+    "гидрометеорология": "Гидрометеорология",
+    "водоохранная зона": "Водоохранная зона",
 }
 
 
-# ============== Маппинг тег → enum_id для поля "Источник" (field_id=212063) ==============
-TAG_TO_SOURCE_ENUM = {
-    # Актуальные enum_id поля 212063 (поле пересоздавалось, старые id 42xxxx/70xxxx/12xxxx мертвы;
-    # сверено с GET /api/v4/leads/custom_fields/212063 25.08.2026)
-    "whatsapp": 1345875,
-    "вотсап": 1345875,
-    "авито": 1345877,     # Авито
-    "avito": 1345877,
-    "2гис": 1345879,      # 2ГИС
-    "2gis": 1345879,
-    "яндекс ук": 1345881,
-    "seo": 1345883,
-    "менеджер": 1345885,
-    "lp new google": 1345887,
-    "lp new яндекс": 1345889,
-    "profzem": 1345891,
-    "гугл": 1345893,
-    "google": 1345893,
-    "1777": 1345895,
-    "исходящий": 1345897,
-    "почта": 1345899,
-    "ltv": 1345901,       # покрывает ltv-сарафан/тиу/пульс частичным совпадением
-    "личные": 1345903,
-    "рекомендация": 1345905,
-    "квиз": 1345907,
+# ============== Маппинг тег → ИМЯ значения поля "Источник" (field_id=212063) ==============
+TAG_TO_SOURCE_NAME = {
+    "whatsapp": "WhatsApp",
+    "вотсап": "WhatsApp",
+    "авито": "Авито",
+    "avito": "Авито",
+    "2гис": "2ГИС",
+    "2gis": "2ГИС",
+    "яндекс ук": "Яндекс УК",
+    "seo": "SEO",
+    "менеджер": "Менеджер",
+    "lp new google": "LP new Google",
+    "lp new яндекс": "LP new Яндекс",
+    "profzem": "ProfZem",
+    "гугл": "Гугл",
+    "google": "Гугл",
+    "1777": "1777",
+    "исходящий": "Исходящий",
+    "почта": "почта (уточняем источник трафика!)",
+    "ltv": "LTV",
+    "личные": "Личные",
+    "рекомендация": "Рекомендация",
+    "квиз": "Квиз",
 }
 
 
-def _match_tag_to_source(tags: list) -> int | None:
-    """Ищет enum_id для поля Источник по тегам сделки."""
+def _match_tag_to_source(tags: list) -> str | None:
+    """Ищет ИМЯ значения поля Источник по тегам сделки."""
     for tag in tags:
         tag_name = (tag.get("name") or "").lower().strip()
-        if tag_name in TAG_TO_SOURCE_ENUM:
-            return TAG_TO_SOURCE_ENUM[tag_name]
+        if tag_name in TAG_TO_SOURCE_NAME:
+            return TAG_TO_SOURCE_NAME[tag_name]
         # Частичное совпадение
-        for keyword, enum_id in TAG_TO_SOURCE_ENUM.items():
+        for keyword, source_name in TAG_TO_SOURCE_NAME.items():
             if keyword in tag_name or tag_name in keyword:
-                return enum_id
+                return source_name
     return None
 
 
@@ -133,18 +135,18 @@ def _shorten_work_type(work_type_text: str) -> str:
     return work_type_text
 
 
-def _match_work_type_enum(work_type_text: str):
-    """Ищет enum_id для поля Интерес по тексту work_type из анализа."""
+def _match_work_type_name(work_type_text: str) -> str | None:
+    """Ищет ИМЯ значения поля Интерес по тексту work_type из анализа."""
     if not work_type_text:
         return None
     text = work_type_text.lower().strip()
     # Точное совпадение
-    if text in WORK_TYPE_ENUM_MAP:
-        return WORK_TYPE_ENUM_MAP[text]
+    if text in WORK_TYPE_TO_INTEREST_NAME:
+        return WORK_TYPE_TO_INTEREST_NAME[text]
     # Частичное совпадение
-    for keyword, enum_id in WORK_TYPE_ENUM_MAP.items():
+    for keyword, name in WORK_TYPE_TO_INTEREST_NAME.items():
         if keyword in text:
-            return enum_id
+            return name
     return None
 
 
@@ -218,18 +220,20 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
         custom_fields = []
         price_to_set = None
 
-        # 0. Источник по тегам (field_id=212063, select)
+        # 0. Источник по тегам (field_id=212063, select; enum_id резолвится по имени)
         if 212063 not in existing_fields:
             tags = lead_data.get("_embedded", {}).get("tags", [])
             if tags:
-                source_enum_id = _match_tag_to_source(tags)
-                if source_enum_id:
-                    custom_fields.append({
-                        "field_id": 212063,
-                        "values": [{"enum_id": source_enum_id}]
-                    })
-                    tag_names = ", ".join(t.get("name", "") for t in tags)
-                    logger.info(f"  📢 Источник (по тегам [{tag_names}]): enum_id={source_enum_id}")
+                source_name = _match_tag_to_source(tags)
+                if source_name:
+                    enum_id = await amocrm_service.resolve_enum_id(212063, source_name)
+                    if enum_id:
+                        custom_fields.append({
+                            "field_id": 212063,
+                            "values": [{"enum_id": enum_id}]
+                        })
+                        tag_names = ", ".join(t.get("name", "") for t in tags)
+                        logger.info(f"  📢 Источник (по тегам [{tag_names}]): {source_name} → enum_id={enum_id}")
 
         # 1. Город (field_id=212029, text)
         if 212029 not in existing_fields:
@@ -241,26 +245,30 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
                 })
                 logger.info(f"  📍 Город: {city}")
 
-        # 2. Интерес / work_type (field_id=212083, select)
+        # 2. Интерес / work_type (field_id=212083, select; enum_id резолвится по имени)
         if 212083 not in existing_fields:
             work_type = getattr(analysis, "work_type", "")
             if work_type and work_type.lower() not in ("не обсуждали", "не указано", "не определено", ""):
-                enum_id = _match_work_type_enum(work_type)
-                if enum_id:
-                    custom_fields.append({
-                        "field_id": 212083,
-                        "values": [{"enum_id": enum_id}]
-                    })
-                    logger.info(f"  🔧 Интерес: {work_type} → enum_id={enum_id}")
+                interest_name = _match_work_type_name(work_type)
+                if interest_name:
+                    enum_id = await amocrm_service.resolve_enum_id(212083, interest_name)
+                    if enum_id:
+                        custom_fields.append({
+                            "field_id": 212083,
+                            "values": [{"enum_id": enum_id}]
+                        })
+                        logger.info(f"  🔧 Интерес: {work_type} → {interest_name} (enum_id={enum_id})")
 
-        # 3. Тип сделки (field_id=212099, select: входящий=423541, исходящий=423543)
+        # 3. Тип сделки (field_id=212099, select; enum_id резолвится по имени)
         if 212099 not in existing_fields:
-            enum_id = 423541 if call_type_simple == "incoming" else 423543
-            custom_fields.append({
-                "field_id": 212099,
-                "values": [{"enum_id": enum_id}]
-            })
-            logger.info(f"  📞 Тип сделки: {call_type_simple}")
+            type_name = "входящий" if call_type_simple == "incoming" else "исходящий"
+            enum_id = await amocrm_service.resolve_enum_id(212099, type_name)
+            if enum_id:
+                custom_fields.append({
+                    "field_id": 212099,
+                    "values": [{"enum_id": enum_id}]
+                })
+                logger.info(f"  📞 Тип сделки: {type_name} (enum_id={enum_id})")
 
         # 4. Схема оплаты (field_id=767917, text)
         if 767917 not in existing_fields:
@@ -566,6 +574,113 @@ async def is_already_processed(record_url: str) -> bool:
         return False
 
 
+# ============== Догоняющий цикл: подхват звонков, потерянных вебхуком ==============
+# 25.08.2026 сервис завис и вебхуки пропали — звонки остались без расшифровки,
+# пока их не догнали вручную. Этот цикл делает потерю вебхука нефатальной:
+# раз в RECONCILE_INTERVAL сканируем звонки за RECONCILE_LOOKBACK и дообрабатываем
+# те, у которых есть запись >= 60с, но нет примечания «АНАЛИЗ ЗВОНКА».
+RECONCILE_ENABLED = os.getenv("RECONCILE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+RECONCILE_INTERVAL = int(os.getenv("RECONCILE_INTERVAL", "180"))    # период скана, сек
+RECONCILE_LOOKBACK = int(os.getenv("RECONCILE_LOOKBACK", "21600"))  # окно скана, сек (6 ч)
+RECONCILE_MIN_AGE = int(os.getenv("RECONCILE_MIN_AGE", "600"))      # звонки моложе — оставляем вебхук-пути
+_RECONCILE_CLAIM_SLACK = 60  # люфт: анализ не может появиться раньше звонка минус slack
+
+
+def _match_covered(call_times: list, note_times: list) -> set:
+    """Жадное паросочетание (как в scripts/backfill_week.py): какие звонки покрыты анализом."""
+    covered, used = set(), [False] * len(note_times)
+    for i, ct in enumerate(call_times):
+        for j, nt in enumerate(note_times):
+            if not used[j] and nt >= ct - _RECONCILE_CLAIM_SLACK:
+                used[j] = True
+                covered.add(i)
+                break
+    return covered
+
+
+async def _reconcile_once():
+    """Один проход: найти звонки с записью без анализа и дообработать."""
+    now = int(time.time())
+    events = await amocrm_service.list_call_events(now - RECONCILE_LOOKBACK)
+    if not events:
+        return
+
+    # Группируем подходящие звонки по сделке (контактные резолвим в активную сделку)
+    by_lead: dict = {}
+    for ev in events:
+        if now - ev["created_at"] < RECONCILE_MIN_AGE:
+            continue
+        note = await amocrm_service.get_note_with_recording(
+            ev["entity_type"].rstrip("s"), ev["entity_id"], ev["note_id"]
+        )
+        if not note:
+            continue
+        params = note.get("params") or {}
+        link = params.get("link")
+        try:
+            duration = int(params.get("duration") or 0)
+        except (ValueError, TypeError):
+            duration = 0
+        if not link or duration < 60:
+            continue
+        if ev["entity_type"] == "leads":
+            lead_id = ev["entity_id"]
+        else:
+            # Сделку из догоняющего цикла НЕ создаём — только ищем активную
+            lead_id = await amocrm_service.get_active_lead_for_contact(ev["entity_id"])
+            if not lead_id:
+                continue
+        by_lead.setdefault(lead_id, []).append(
+            {"ev": ev, "note": note, "link": link, "duration": duration}
+        )
+
+    for lead_id, calls in by_lead.items():
+        calls.sort(key=lambda c: c["note"].get("created_at", 0))
+        call_times = [c["note"].get("created_at", 0) for c in calls]
+        note_times = await amocrm_service.list_analysis_note_times(
+            lead_id, call_times[0] - _RECONCILE_CLAIM_SLACK
+        )
+        covered = _match_covered(call_times, note_times)
+        for i, c in enumerate(calls):
+            if i in covered:
+                continue
+            if await is_already_processed(c["link"]):
+                continue  # уже обработан/в работе у этого процесса
+            note = c["note"]
+            logger.info(
+                f"🩹 Reconcile: звонок без анализа — note {note.get('id')} "
+                f"({c['duration']}с) → сделка #{lead_id}"
+            )
+            call_type = "incoming_call" if note.get("note_type") == "call_in" else "outgoing_call"
+            try:
+                await process_call(
+                    entity_id=c["ev"]["entity_id"],
+                    call_type=call_type,
+                    record_url=c["link"],
+                    call_created_at=note.get("created_at"),
+                    responsible_user_id=note.get("responsible_user_id"),
+                    phone=(note.get("params") or {}).get("phone", ""),
+                    entity_type=c["ev"]["entity_type"],
+                    call_direction=note.get("note_type"),
+                    expected_duration=c["duration"],
+                )
+            except Exception as e:
+                logger.error(f"❌ Reconcile: ошибка дообработки note {note.get('id')}: {e}")
+
+
+async def _reconcile_loop():
+    logger.info(
+        f"🩹 Догоняющий цикл включён: каждые {RECONCILE_INTERVAL}с, "
+        f"окно {RECONCILE_LOOKBACK // 3600}ч, min age {RECONCILE_MIN_AGE}с"
+    )
+    while True:
+        await asyncio.sleep(RECONCILE_INTERVAL)
+        try:
+            await _reconcile_once()
+        except Exception as e:
+            logger.error(f"❌ Ошибка догоняющего цикла: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Обработчик жизненного цикла приложения"""
@@ -594,9 +709,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         # Не валим старт: пусть поднимется хотя бы healthcheck.
         logger.error(f"❌ Ошибка конфигурации/старта: {e}")
-    
+
+    reconcile_task = None
+    if RECONCILE_ENABLED:
+        reconcile_task = asyncio.create_task(_reconcile_loop())
+    else:
+        logger.info("🩹 Догоняющий цикл выключен (RECONCILE_ENABLED=false)")
+
     yield
-    
+
+    if reconcile_task:
+        reconcile_task.cancel()
+
     # Остановка
     logger.info("🛑 Остановка сервера...")
     # Не спамим в Telegram
@@ -1016,13 +1140,10 @@ async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
         # 8. Определяем тип звонка
         call_type = "incoming_call" if actual_note_type == "call_in" else "outgoing_call"
         
-        # 9. Запускаем обработку в фоне
-        # Начальная задержка: даём vmclouds время на обработку записи
-        if call_duration and call_duration > 30:
-            initial_delay = 15  # 15 секунд для записей длиннее 30с
-            logger.info(f"⏳ Ждём {initial_delay}с перед скачиванием (запись {call_duration}с, vmclouds может быть не готов)")
-        else:
-            initial_delay = 0
+        # 9. Запускаем обработку в фоне.
+        # onlinePBX отдаёт запись сразу — стартуем без паузы. Если файл окажется
+        # неполным, _ensure_full_recording сам подождёт и перекачает (наследие vmclouds).
+        initial_delay = 0
 
         raw_created_at = note_data.get("created_at")
         background_tasks.add_task(
