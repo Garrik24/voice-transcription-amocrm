@@ -14,7 +14,6 @@ from config import (
     ANTHROPIC_API_KEY,
     ANTHROPIC_MODEL,
     OPENAI_MAX_TOKENS,
-    ANALYSIS_TEMPERATURE,
     ANALYSIS_PIPELINE_VERSION,
     MAX_TRANSCRIPT_LENGTH,
     TRUNCATE_TRANSCRIPT_FOR_ANALYSIS,
@@ -569,7 +568,6 @@ class AnalysisService:
         system_prompt: str,
         user_prompt: str,
         max_tokens: int = 2500,
-        temperature: float = 0.1,
     ) -> str:
         """
         Универсальный вызов Claude API.
@@ -581,7 +579,6 @@ class AnalysisService:
         response = await client.messages.create(
             model=model,
             max_tokens=max_tokens,
-            temperature=temperature,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -626,7 +623,6 @@ class AnalysisService:
                 system_prompt=FACT_VERIFIER_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 max_tokens=1200,
-                temperature=0.0,
             )
             parsed = _extract_json_from_text(result_text)
             return self._normalize_verification_result(parsed)
@@ -697,7 +693,6 @@ class AnalysisService:
                     transcript=prepared_transcript,
                 ),
                 max_tokens=800,
-                temperature=0.1,
             )
             return _extract_json_from_text(result_text)
 
@@ -841,7 +836,6 @@ class AnalysisService:
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         max_tokens=max_tokens,
-                        temperature=ANALYSIS_TEMPERATURE,
                     )
 
                     logger.info(
