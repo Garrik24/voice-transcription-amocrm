@@ -837,7 +837,7 @@ async def _missed_calls_pass(all_calls: list, now: int):
             lead_id = ev["entity_id"]
         else:
             lead_id = await amocrm_service.get_active_lead_for_contact(ev["entity_id"])
-        if not lead_id:
+        if not lead_id or lead_id in _SPAM_HANDLED:
             _MISSED_HANDLED.add(nid)
             continue
         # Guard, переживающий рестарт: наша задача уже стоит на сделке
@@ -919,16 +919,17 @@ async def _reconcile_once():
             "created_at": note.get("created_at", 0),
         })
 
-    if MISSED_CALL_TASK_ENABLED:
-        try:
-            await _missed_calls_pass(all_calls, now)
-        except Exception as e:
-            logger.error(f"❌ Ошибка прохода по пропущенным: {e}")
+    # Спам-проход раньше missed-прохода: на закрытую спам-сделку задача не ставится
     if SPAM_AUTOCLOSE_ENABLED:
         try:
             await _spam_autoclose_pass(all_calls, now)
         except Exception as e:
             logger.error(f"❌ Ошибка спам-прохода: {e}")
+    if MISSED_CALL_TASK_ENABLED:
+        try:
+            await _missed_calls_pass(all_calls, now)
+        except Exception as e:
+            logger.error(f"❌ Ошибка прохода по пропущенным: {e}")
 
     # Группируем подходящие звонки по сделке (контактные резолвим в активную сделку)
     by_lead: dict = {}
