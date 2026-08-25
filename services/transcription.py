@@ -1150,6 +1150,9 @@ class TranscriptionService:
             return ".ogg"
         elif audio_data[:4] == b'fLaC':
             return ".flac"
+        elif audio_data[4:8] == b'ftyp':
+            # MP4-контейнер: m4a-голосовые из WhatsApp-чатов
+            return ".m4a"
         else:
             return ".mp3"
 
@@ -1158,6 +1161,7 @@ class TranscriptionService:
         """Возвращает MIME-тип по расширению."""
         return {
             ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
             ".wav": "audio/wav",
             ".ogg": "audio/ogg",
             ".flac": "audio/flac",
