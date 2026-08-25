@@ -124,6 +124,63 @@ class AmoCRMService:
         ]
         return sorted(times)
 
+    async def get_open_tasks(self, lead_id: int) -> list:
+        """Открытые (невыполненные) задачи сделки."""
+        try:
+            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+                response = await client.get(
+                    f"{self.base_url}/tasks",
+                    headers=self.headers,
+                    params={
+                        "filter[entity_type]": "leads",
+                        "filter[entity_id]": lead_id,
+                        "filter[is_completed]": 0,
+                        "limit": 10,
+                    },
+                )
+                if response.status_code == 204:
+                    return []
+                response.raise_for_status()
+                return response.json().get("_embedded", {}).get("tasks", [])
+        except Exception as e:
+            logger.warning(f"⚠️ get_open_tasks({lead_id}): {e}")
+            return []
+
+    async def create_task(
+        self,
+        lead_id: int,
+        text: str,
+        complete_till: int,
+        responsible_user_id: Optional[int] = None,
+        task_type_id: int = 1,
+    ) -> bool:
+        """Создаёт задачу, привязанную к сделке (task_type_id=1 — «Связаться»)."""
+        payload = {
+            "task_type_id": task_type_id,
+            "text": text,
+            "complete_till": int(complete_till),
+            "entity_id": lead_id,
+            "entity_type": "leads",
+        }
+        if responsible_user_id:
+            payload["responsible_user_id"] = int(responsible_user_id)
+        try:
+            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+                response = await client.post(
+                    f"{self.base_url}/tasks",
+                    headers=self.headers,
+                    json=[payload],
+                )
+                response.raise_for_status()
+                logger.info(f"✅ Задача создана для сделки #{lead_id} (срок {complete_till})")
+                return True
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ Ошибка создания задачи для #{lead_id}: {e} | {e.response.text[:300]}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания задачи для #{lead_id}: {e}")
+            return False
+
     async def get_recent_calls(self, minutes: int = 10) -> list:
         """
         Получает список недавних звонков из AmoCRM.

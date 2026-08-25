@@ -12,7 +12,7 @@ import re
 import shutil
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, File, Form, UploadFile
 from fastapi.responses import JSONResponse
@@ -574,6 +574,166 @@ async def is_already_processed(record_url: str) -> bool:
         return False
 
 
+# ============== Авто-задача менеджеру по итогам звонка ==============
+AUTO_TASK_ENABLED = os.getenv("AUTO_TASK_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+
+_WEEKDAYS = {
+    "понедельник": 0, "вторник": 1, "среда": 2, "сред": 2, "четверг": 3,
+    "пятниц": 4, "суббот": 5, "воскресен": 6,
+}
+_MONTHS = {
+    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6,
+    "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
+}
+_WORD_NUMS = {
+    "первого": 1, "второго": 2, "третьего": 3, "четвертого": 4, "четвёртого": 4,
+    "пятого": 5, "шестого": 6, "седьмого": 7, "восьмого": 8, "девятого": 9, "десятого": 10,
+}
+_MSK_TZ = timezone(timedelta(hours=3))
+
+
+def _parse_next_contact_ts(text: str, now_utc: Optional[datetime] = None) -> Optional[int]:
+    """
+    Переводит фразу next_contact_date («пятница», «завтра», «1-го числа», «15 января»,
+    «через неделю») в unix timestamp срока задачи. Времена — по МСК: будущий день → 10:00,
+    «сегодня» → 18:00 (если уже поздно — завтра 10:00). Не распознали → None.
+    """
+    if not text:
+        return None
+    t = text.lower().strip()
+    if t in ("не указано", "не определено", "не обсуждали", ""):
+        return None
+
+    if now_utc is None:
+        now_msk = datetime.now(_MSK_TZ)
+    else:
+        now_msk = now_utc.replace(tzinfo=timezone.utc).astimezone(_MSK_TZ)
+    today = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def ts_at(day: datetime, hour: int = 10) -> int:
+        # day — aware (МСК), поэтому timestamp() не зависит от TZ хоста
+        return int(day.replace(hour=hour).timestamp())
+
+    def today_or_tomorrow() -> int:
+        # «сегодня»: конец рабочего дня; если он уже близко/прошёл — завтра утром
+        if now_msk.hour < 17:
+            return ts_at(today, 18)
+        return ts_at(today + timedelta(days=1), 10)
+
+    if "сегодня" in t or "текущий день" in t:
+        return today_or_tomorrow()
+    if "послезавтра" in t:
+        return ts_at(today + timedelta(days=2))
+    if "завтра" in t or "следующий день" in t:
+        return ts_at(today + timedelta(days=1))
+    if "через недел" in t:
+        return ts_at(today + timedelta(days=7))
+    if "через месяц" in t:
+        return ts_at(today + timedelta(days=30))
+    m = re.search(r"через\s+(\d+)\s*(день|дня|дней)", t)
+    if m:
+        return ts_at(today + timedelta(days=int(m.group(1))))
+
+    # День недели («в пятницу», «понедельник») → ближайший будущий; сегодня → сегодня 18:00
+    for stem, wd in _WEEKDAYS.items():
+        if stem in t:
+            delta = (wd - today.weekday()) % 7
+            if delta == 0:
+                return today_or_tomorrow()
+            return ts_at(today + timedelta(days=delta))
+
+    # «15 января», «1 сентября»
+    m = re.search(r"(\d{1,2})\s*([а-яё]+)", t)
+    if m:
+        day_num = int(m.group(1))
+        for stem, month in _MONTHS.items():
+            if m.group(2).startswith(stem):
+                if 1 <= day_num <= 31:
+                    year = today.year
+                    try:
+                        target = today.replace(year=year, month=month, day=day_num)
+                    except ValueError:
+                        return None
+                    if target < today:
+                        target = target.replace(year=year + 1)
+                    return ts_at(target)
+
+    # «1-го числа», «первого числа», «5 числа» → ближайшее такое число месяца
+    m = re.search(r"(\d{1,2})(?:-?го)?\s*числ", t)
+    day_num = int(m.group(1)) if m else None
+    if day_num is None and "числ" in t:
+        for word, n in _WORD_NUMS.items():
+            if word in t:
+                day_num = n
+                break
+    if day_num and 1 <= day_num <= 31:
+        try:
+            target = today.replace(day=day_num)
+        except ValueError:
+            target = None
+        if target is None or target <= today:
+            nxt = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+            try:
+                target = nxt.replace(day=day_num)
+            except ValueError:
+                return None
+        return ts_at(target)
+
+    return None
+
+
+async def _create_followup_task(lead_id: int, analysis, responsible_user_id: Optional[int]):
+    """
+    Ставит менеджеру задачу по итогам звонка: текст — из next_steps (пункты «Менеджеру:»),
+    срок — из next_contact_date (не распознали → завтра 10:00 МСК).
+    Дубли не плодим: если у сделки уже есть открытая задача — пропускаем.
+    """
+    try:
+        open_tasks = await amocrm_service.get_open_tasks(lead_id)
+        if open_tasks:
+            logger.info(f"⏭️ Задача не создана: у сделки #{lead_id} уже есть открытая задача (#{open_tasks[0].get('id')})")
+            return
+
+        steps = [s.strip() for s in (getattr(analysis, "next_steps", None) or []) if str(s).strip()]
+        manager_steps = []
+        for s in steps:
+            low = s.lower()
+            if low.startswith("менеджеру"):
+                cleaned = re.sub(r"^менеджеру\s*[:—-]?\s*", "", s, flags=re.IGNORECASE).strip()
+                if cleaned:
+                    manager_steps.append(cleaned)
+        lines = manager_steps[:3]
+
+        next_contact = (getattr(analysis, "next_contact_date", "") or "").strip()
+        has_contact = next_contact.lower() not in ("не указано", "не определено", "не обсуждали", "")
+
+        if lines:
+            text = "По итогам звонка (AI):\n" + "\n".join(f"• {l}" for l in lines)
+        else:
+            text = "Связаться с клиентом по итогам звонка (AI)"
+        if has_contact:
+            text += f"\nСлед. контакт: {next_contact}"
+
+        complete_till = _parse_next_contact_ts(next_contact)
+        if complete_till is None:
+            # завтра 10:00 МСК
+            tomorrow = datetime.now(_MSK_TZ).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            complete_till = int(tomorrow.replace(hour=10).timestamp())
+
+        ok = await amocrm_service.create_task(
+            lead_id=lead_id,
+            text=text[:500],
+            complete_till=complete_till,
+            responsible_user_id=responsible_user_id,
+        )
+        if ok:
+            due = datetime.fromtimestamp(complete_till, _MSK_TZ)
+            logger.info(f"📋 Задача менеджеру по сделке #{lead_id}: срок {due:%d.%m %H:%M} МСК")
+    except Exception as e:
+        # Задача — вишенка, не роняем пайплайн
+        logger.error(f"❌ Ошибка создания авто-задачи для #{lead_id}: {e}")
+
+
 # ============== Догоняющий цикл: подхват звонков, потерянных вебхуком ==============
 # 25.08.2026 сервис завис и вебхуки пропали — звонки остались без расшифровки,
 # пока их не догнали вручную. Этот цикл делает потерю вебхука нефатальной:
@@ -909,6 +1069,10 @@ async def process_call(
 
             # 5.6. Имя клиента → карточка контакта (через вебхук-контакт или контакт сделки)
             await _update_contact_name_from_analysis(analysis, entity_type, entity_id, lead_id)
+
+            # 5.7. Задача менеджеру по итогам звонка (guard: не дублируем открытые)
+            if AUTO_TASK_ENABLED and target_entity_type == "leads":
+                await _create_followup_task(lead_id, analysis, responsible_user_id)
 
         # 6. Формируем примечание
         note_text = analysis_service.format_note(
