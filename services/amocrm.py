@@ -124,6 +124,28 @@ class AmoCRMService:
         ]
         return sorted(times)
 
+    async def close_lead_as_spam(self, lead_id: int, loss_reason_id: int = 22393318) -> bool:
+        """Закрывает сделку в 143 («закрыто и не реализовано») с причиной СПАМ (22393318)."""
+        ok, err = await self._patch_lead(lead_id, {"status_id": 143, "loss_reason_id": loss_reason_id})
+        if not ok:
+            logger.error(f"❌ Не удалось закрыть сделку #{lead_id} как спам: {err}")
+        return ok
+
+    async def complete_task(self, task_id: int, result_text: str = "") -> bool:
+        """Завершает задачу с текстом результата."""
+        try:
+            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+                response = await client.patch(
+                    f"{self.base_url}/tasks/{task_id}",
+                    headers=self.headers,
+                    json={"is_completed": True, "result": {"text": result_text or "Выполнено"}},
+                )
+                response.raise_for_status()
+                return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка завершения задачи #{task_id}: {e}")
+            return False
+
     async def get_open_tasks(self, lead_id: int) -> list:
         """Открытые (невыполненные) задачи сделки."""
         try:

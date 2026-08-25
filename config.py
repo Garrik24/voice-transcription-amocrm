@@ -80,6 +80,9 @@ ANALYSIS_TEMPERATURE = float(os.getenv("ANALYSIS_TEMPERATURE", "0.1"))
 # скрывало баги: fact verifier есть только в v2, поэтому локальный прогон
 # вёл себя иначе, чем прод (так был упущен случай, когда верификатор
 # заменял имя менеджера из CRM на заглушку).
+# Минимальная длительность звонка для анализа, сек (короче — сброс/автоответчик)
+MIN_CALL_SECONDS = int(os.getenv("MIN_CALL_SECONDS", "25"))
+
 ANALYSIS_PIPELINE_VERSION = os.getenv("ANALYSIS_PIPELINE_VERSION", "v3").strip().lower()
 
 # Максимальная длина транскрипции для анализа (символов)

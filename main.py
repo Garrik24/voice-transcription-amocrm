@@ -17,7 +17,7 @@ from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 
-from config import PORT, DEBUG, AMOCRM_DOMAIN, STT_PROVIDER, validate_config
+from config import PORT, DEBUG, AMOCRM_DOMAIN, STT_PROVIDER, MIN_CALL_SECONDS, validate_config
 from services.amocrm import amocrm_service
 from services.transcription import transcription_service
 from services.analysis import analysis_service
@@ -133,6 +133,22 @@ def _shorten_work_type(work_type_text: str) -> str:
         if keyword in text:
             return short
     return work_type_text
+
+
+def _match_call_result_name(call_result: str) -> str | None:
+    """Сводит свободный call_result из анализа к значению поля «Итог звонка (AI)» (770463)."""
+    if not call_result:
+        return None
+    t = call_result.lower()
+    if "соглас" in t or "договор" in t:
+        return "Согласие"
+    if "отказ" in t or "не интерес" in t:
+        return "Отказ"
+    if "перезвон" in t:
+        return "Перезвонить"
+    if "дума" in t:
+        return "Думает"
+    return "Не определено"
 
 
 def _match_work_type_name(work_type_text: str) -> str | None:
@@ -279,6 +295,18 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str):
                     "values": [{"value": payment}]
                 })
                 logger.info(f"  💳 Схема оплаты: {payment}")
+
+        # 4.5. Итог звонка (field_id=770463, select) — итог ПОСЛЕДНЕГО звонка,
+        # содержательные значения перезаписывают старые; «Не определено» — только в пустое поле
+        outcome_name = _match_call_result_name(getattr(analysis, "call_result", "") or "")
+        if outcome_name and (outcome_name != "Не определено" or 770463 not in existing_fields):
+            enum_id = await amocrm_service.resolve_enum_id(770463, outcome_name)
+            if enum_id:
+                custom_fields.append({
+                    "field_id": 770463,
+                    "values": [{"enum_id": enum_id}]
+                })
+                logger.info(f"  🎯 Итог звонка: {outcome_name}")
 
         # 5. Бюджет сделки (встроенное поле price)
         if not existing_price or existing_price == 0:
@@ -758,6 +786,112 @@ def _match_covered(call_times: list, note_times: list) -> set:
     return covered
 
 
+# --- Пропущенные звонки без перезвона + спам-автозакрытие (работают в том же цикле) ---
+MISSED_CALL_TASK_ENABLED = os.getenv("MISSED_CALL_TASK_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+MISSED_CALL_GRACE = int(os.getenv("MISSED_CALL_GRACE", "7200"))  # сек: даём менеджерам перезвонить самим
+SPAM_AUTOCLOSE_ENABLED = os.getenv("SPAM_AUTOCLOSE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+
+_MISSED_HANDLED: set = set()      # note_id пропущенных, по которым задача уже есть (in-memory)
+_SPAM_HANDLED: set = set()        # lead_id закрытых/проверенных спам-сделок
+_SPAM_CHECKED_AT: dict = {}       # lead_id -> ts последней проверки нот (не чаще раза в 30 мин)
+
+
+def _norm_phone(phone: str) -> str:
+    """Последние 10 цифр — чтобы +7/8/7 варианты совпадали."""
+    digits = re.sub(r"\D", "", str(phone or ""))
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def _next_work_slot_ts() -> int:
+    """Срок задачи «перезвонить»: через час, но в рабочее окно 9–18 МСК."""
+    t = datetime.now(_MSK_TZ) + timedelta(hours=1)
+    if t.hour >= 18:
+        t = (t + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+    elif t.hour < 9:
+        t = t.replace(hour=10, minute=0, second=0, microsecond=0)
+    return int(t.timestamp())
+
+
+async def _missed_calls_pass(all_calls: list, now: int):
+    """Пропущенный входящий, по которому за MISSED_CALL_GRACE не было разговора, → задача."""
+    answered = [c for c in all_calls if c["duration"] > 0]
+    for c in all_calls:
+        note = c["note"]
+        if note.get("note_type") != "call_in" or c["duration"] > 0:
+            continue
+        if now - c["created_at"] < MISSED_CALL_GRACE:
+            continue
+        nid = note.get("id")
+        if nid in _MISSED_HANDLED:
+            continue
+        phone = _norm_phone(c["phone"])
+        if not phone:
+            _MISSED_HANDLED.add(nid)
+            continue
+        # После пропущенного был состоявшийся разговор с этим номером (в любую сторону)?
+        if any(_norm_phone(a["phone"]) == phone and a["created_at"] > c["created_at"] for a in answered):
+            _MISSED_HANDLED.add(nid)
+            continue
+        ev = c["ev"]
+        if ev["entity_type"] == "leads":
+            lead_id = ev["entity_id"]
+        else:
+            lead_id = await amocrm_service.get_active_lead_for_contact(ev["entity_id"])
+        if not lead_id:
+            _MISSED_HANDLED.add(nid)
+            continue
+        # Guard, переживающий рестарт: наша задача уже стоит на сделке
+        open_tasks = await amocrm_service.get_open_tasks(lead_id)
+        if any("пропущенный звонок" in (t.get("text") or "").lower() for t in open_tasks):
+            _MISSED_HANDLED.add(nid)
+            continue
+        when = datetime.fromtimestamp(c["created_at"], _MSK_TZ).strftime("%H:%M")
+        ok = await amocrm_service.create_task(
+            lead_id=lead_id,
+            text=f"Перезвонить: пропущенный звонок с +7{phone} в {when}, никто не перезвонил",
+            complete_till=_next_work_slot_ts(),
+            responsible_user_id=note.get("responsible_user_id"),
+        )
+        if ok:
+            _MISSED_HANDLED.add(nid)
+            logger.info(f"📵 Пропущенный без перезвона → задача по сделке #{lead_id} (звонок {when})")
+
+
+async def _spam_autoclose_pass(all_calls: list, now: int):
+    """Сделка со спам-вердиктом Block и без состоявшегося разговора → закрыть с причиной СПАМ."""
+    seen = set()
+    for c in all_calls:
+        ev = c["ev"]
+        if ev["entity_type"] != "leads":
+            continue
+        lead_id = ev["entity_id"]
+        if lead_id in seen or lead_id in _SPAM_HANDLED:
+            continue
+        seen.add(lead_id)
+        # Состоявшийся разговор по сделке → не автоспам, решает менеджер
+        if any(x["duration"] >= MIN_CALL_SECONDS and x["ev"]["entity_type"] == "leads"
+               and x["ev"]["entity_id"] == lead_id for x in all_calls):
+            continue
+        if now - _SPAM_CHECKED_AT.get(lead_id, 0) < 1800:
+            continue
+        _SPAM_CHECKED_AT[lead_id] = now
+        notes = await amocrm_service.get_recent_notes("leads", lead_id, limit=10)
+        def _txt(n):
+            return ((n.get("params") or {}).get("text") or "")
+        has_block = any("СПАМ-НОМЕР" in _txt(n) and "Block" in _txt(n) for n in notes)
+        if not has_block:
+            continue
+        lead = await amocrm_service.get_lead(lead_id)
+        if not lead or lead.get("status_id") in (142, 143):
+            _SPAM_HANDLED.add(lead_id)
+            continue
+        if await amocrm_service.close_lead_as_spam(lead_id):
+            _SPAM_HANDLED.add(lead_id)
+            for t in await amocrm_service.get_open_tasks(lead_id):
+                await amocrm_service.complete_task(t["id"], "Закрыто автоматически: спам-номер (вердикт Block)")
+            logger.info(f"🚫 Сделка #{lead_id} закрыта как СПАМ (Block, разговора не было)")
+
+
 async def _reconcile_once():
     """Один проход: найти звонки с записью без анализа и дообработать."""
     now = int(time.time())
@@ -765,23 +899,44 @@ async def _reconcile_once():
     if not events:
         return
 
-    # Группируем подходящие звонки по сделке (контактные резолвим в активную сделку)
-    by_lead: dict = {}
+    # Собираем ВСЕ звонки окна (включая пропущенные и короткие — они нужны
+    # проходам missed/spam), затем фильтруем для дообработки анализом
+    all_calls: list = []
     for ev in events:
-        if now - ev["created_at"] < RECONCILE_MIN_AGE:
-            continue
         note = await amocrm_service.get_note_with_recording(
             ev["entity_type"].rstrip("s"), ev["entity_id"], ev["note_id"]
         )
         if not note:
             continue
         params = note.get("params") or {}
-        link = params.get("link")
         try:
             duration = int(params.get("duration") or 0)
         except (ValueError, TypeError):
             duration = 0
-        if not link or duration < 60:
+        all_calls.append({
+            "ev": ev, "note": note, "link": params.get("link"),
+            "duration": duration, "phone": str(params.get("phone") or ""),
+            "created_at": note.get("created_at", 0),
+        })
+
+    if MISSED_CALL_TASK_ENABLED:
+        try:
+            await _missed_calls_pass(all_calls, now)
+        except Exception as e:
+            logger.error(f"❌ Ошибка прохода по пропущенным: {e}")
+    if SPAM_AUTOCLOSE_ENABLED:
+        try:
+            await _spam_autoclose_pass(all_calls, now)
+        except Exception as e:
+            logger.error(f"❌ Ошибка спам-прохода: {e}")
+
+    # Группируем подходящие звонки по сделке (контактные резолвим в активную сделку)
+    by_lead: dict = {}
+    for c in all_calls:
+        ev, note, link, duration = c["ev"], c["note"], c["link"], c["duration"]
+        if now - ev["created_at"] < RECONCILE_MIN_AGE:
+            continue
+        if not link or duration < MIN_CALL_SECONDS:
             continue
         if ev["entity_type"] == "leads":
             lead_id = ev["entity_id"]
@@ -1020,9 +1175,9 @@ async def process_call(
 
         # 3.1. Проверяем длительность звонка
         # Меньше 60 секунд = автоответчик, сброс, не состоялся — не обрабатываем
-        if transcription.duration_seconds < 60:
+        if transcription.duration_seconds < MIN_CALL_SECONDS:
             logger.info(
-                f"⏭️ Звонок слишком короткий ({transcription.duration_seconds:.0f} сек < 60 сек) — "
+                f"⏭️ Звонок слишком короткий ({transcription.duration_seconds:.0f} сек < {MIN_CALL_SECONDS} сек) — "
                 "пропускаем обработку"
             )
             return
@@ -1430,9 +1585,9 @@ async def process_uploaded_audio(
             return
 
         # 1.1. Проверяем длительность звонка
-        if transcription.duration_seconds < 60:
+        if transcription.duration_seconds < MIN_CALL_SECONDS:
             logger.info(
-                f"⏭️ Звонок слишком короткий ({transcription.duration_seconds:.0f} сек < 60 сек) — "
+                f"⏭️ Звонок слишком короткий ({transcription.duration_seconds:.0f} сек < {MIN_CALL_SECONDS} сек) — "
                 "пропускаем обработку"
             )
             return
