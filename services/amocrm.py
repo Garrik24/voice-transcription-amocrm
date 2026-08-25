@@ -678,6 +678,22 @@ class AmoCRMService:
         logger.info(f"✅ Создана новая сделка #{new_lead_id} для контакта #{contact_id}")
         return new_lead_id
 
+    async def _patch_lead(self, lead_id: int, body: dict) -> tuple:
+        """PATCH /api/v4/leads/{id}. Возвращает (успех, текст ошибки amoCRM)."""
+        try:
+            async with httpx.AsyncClient(timeout=30.0, verify=self.verify_ssl) as client:
+                response = await client.patch(
+                    f"{self.base_url}/leads/{lead_id}",
+                    headers=self.headers,
+                    json=body,
+                )
+                response.raise_for_status()
+                return True, ""
+        except httpx.HTTPStatusError as e:
+            return False, f"{e} | ответ amoCRM: {e.response.text[:500]}"
+        except Exception as e:
+            return False, str(e)
+
     async def update_lead_fields(
         self,
         lead_id: int,
@@ -688,11 +704,9 @@ class AmoCRMService:
         """
         Обновляет поля сделки через PATCH /api/v4/leads/{id}.
 
-        Args:
-            lead_id: ID сделки
-            custom_fields_values: Список custom fields в формате amoCRM API
-            price: Бюджет сделки (встроенное поле)
-            name: Название сделки
+        Сначала всё одним запросом; при ошибке (например, протухший enum_id
+        одного из полей — amoCRM отбрасывает ВЕСЬ батч) повторяем по одному
+        полю за запрос: записываем всё валидное и видим в логе, какое поле отбито.
         """
         body = {}
         if custom_fields_values:
@@ -706,19 +720,33 @@ class AmoCRMService:
             logger.info(f"⏭️ Нечего обновлять в сделке #{lead_id}")
             return True
 
-        try:
-            async with httpx.AsyncClient(timeout=30.0, verify=self.verify_ssl) as client:
-                response = await client.patch(
-                    f"{self.base_url}/leads/{lead_id}",
-                    headers=self.headers,
-                    json=body,
-                )
-                response.raise_for_status()
-                logger.info(f"✅ Поля сделки #{lead_id} обновлены: {list(body.keys())}")
-                return True
-        except Exception as e:
-            logger.error(f"❌ Ошибка обновления полей сделки #{lead_id}: {e}")
+        ok, err = await self._patch_lead(lead_id, body)
+        if ok:
+            logger.info(f"✅ Поля сделки #{lead_id} обновлены: {list(body.keys())}")
+            return True
+
+        logger.error(f"❌ Ошибка обновления полей сделки #{lead_id}: {err}")
+
+        # Фолбэк: по одному полю за запрос
+        parts = []
+        for cf in (custom_fields_values or []):
+            parts.append(({"custom_fields_values": [cf]}, f"field_id={cf.get('field_id')}"))
+        if price is not None:
+            parts.append(({"price": price}, "price"))
+        if name is not None:
+            parts.append(({"name": name}, "name"))
+        if len(parts) < 2:
             return False
+
+        saved = 0
+        for part_body, label in parts:
+            part_ok, part_err = await self._patch_lead(lead_id, part_body)
+            if part_ok:
+                saved += 1
+            else:
+                logger.error(f"  ❌ Сделка #{lead_id}, {label} отбито: {part_err}")
+        logger.info(f"🔁 Сделка #{lead_id}: фолбэк по одному полю — записано {saved}/{len(parts)}")
+        return saved > 0
 
     async def update_contact_name(self, contact_id: int, name: str) -> bool:
         """
