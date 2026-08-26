@@ -602,6 +602,12 @@ async def _ensure_full_recording(
     return best_data
 
 
+async def is_processed_peek(record_url: str) -> bool:
+    """Проверка БЕЗ пометки — для догоняющего цикла (пометит сам process_call)."""
+    async with PROCESSED_LOCK:
+        return record_url in PROCESSED_CALLS
+
+
 async def is_already_processed(record_url: str) -> bool:
     """Проверяет, обрабатывался ли уже этот звонок по URL записи"""
     async with PROCESSED_LOCK:
@@ -972,8 +978,10 @@ async def _reconcile_once():
         for i, c in enumerate(calls):
             if i in covered:
                 continue
-            if await is_already_processed(c["link"]):
+            if await is_processed_peek(c["link"]):
                 continue  # уже обработан/в работе у этого процесса
+            # ВАЖНО: не вызывать здесь is_already_processed — она ПОМЕЧАЕТ url,
+            # и process_call внутри себя видел «уже обработан» и молча выходил
             note = c["note"]
             logger.info(
                 f"🩹 Reconcile: звонок без анализа — note {note.get('id')} "
