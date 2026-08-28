@@ -34,52 +34,69 @@ _last_sent: dict[str, float] = {}
 _active: set[str] = set()
 
 
+# Признаки «кончились деньги». Провайдеры меняют формулировки и коды на ходу:
+# 28.08.2026 OpenAI переименовал code 'insufficient_quota' → 'credit_balance_exhausted',
+# и привязка к одному коду обезоружила сразу и алерты, и фолбэк на резервный STT.
+# Поэтому смотрим три независимых сигнала: code, type и текст сообщения.
+QUOTA_CODES = {
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "billing_hard_limit_reached",
+    "billing_not_active",
+}
+QUOTA_HINTS = (
+    "no credits remaining",
+    "credit balance",
+    "exceeded your current quota",
+    "billing details",
+    "billing hard limit",
+    "quota",
+)
+AUTH_CODES = {"invalid_api_key", "account_deactivated", "invalid_authentication"}
+
+
+def _is_quota(code: Optional[str], type_: Optional[str], message: str) -> bool:
+    """Кончились деньги? Любого из сигналов достаточно."""
+    if code in QUOTA_CODES or type_ in QUOTA_CODES:
+        return True
+    return any(hint in message for hint in QUOTA_HINTS)
+
+
 def classify(exc: BaseException) -> Optional[Tuple[str, str, str]]:
     """
     Определяет, является ли ошибка инфраструктурной.
 
     Returns:
         (kind, provider, human_text) либо None — если ошибка обычная
-        (сеть, битое аудио, таймаут и т.п.) и алерт не нужен.
+        (сеть, битое аудио, таймаут, обычный rate limit) и алерт не нужен.
     """
-    # --- OpenAI (Whisper STT) ---
-    # openai.APIError заполняет .code из тела ответа: 'insufficient_quota',
-    # 'invalid_api_key' и т.п. RateLimitError/AuthenticationError — подклассы
-    # APIStatusError, поэтому одной проверки достаточно.
-    if isinstance(exc, openai.APIStatusError):
-        code = getattr(exc, "code", None)
-        status = getattr(exc, "status_code", None)
-        if code == "insufficient_quota":
-            return (
-                KIND_QUOTA,
-                "OpenAI",
-                "Закончился баланс OpenAI — Whisper не расшифровывает звонки.",
-            )
-        if status == 401 or code in ("invalid_api_key", "account_deactivated"):
-            return (
-                KIND_AUTH,
-                "OpenAI",
-                "Ключ OpenAI недействителен или отозван.",
-            )
-        # 429 без insufficient_quota — обычный rate limit, SDK сам ретраит. Не алертим.
+    for lib, provider, quota_text, auth_text in (
+        (
+            openai,
+            "OpenAI",
+            "Закончился баланс OpenAI — Whisper не расшифровывает звонки.",
+            "Ключ OpenAI недействителен или отозван.",
+        ),
+        (
+            anthropic,
+            "Anthropic",
+            "Закончился баланс Anthropic — анализ звонков не выполняется.",
+            "Ключ Anthropic недействителен или отозван.",
+        ),
+    ):
+        if not isinstance(exc, lib.APIStatusError):
+            continue
 
-    # --- Anthropic (анализ звонка) ---
-    # anthropic.APIError НЕ заполняет .code, поэтому смотрим статус и текст.
-    if isinstance(exc, anthropic.APIStatusError):
         status = getattr(exc, "status_code", None)
-        msg = (getattr(exc, "message", "") or str(exc)).lower()
-        if "credit balance" in msg or "billing" in msg:
-            return (
-                KIND_QUOTA,
-                "Anthropic",
-                "Закончился баланс Anthropic — анализ звонков не выполняется.",
-            )
-        if status == 401:
-            return (
-                KIND_AUTH,
-                "Anthropic",
-                "Ключ Anthropic недействителен или отозван.",
-            )
+        code = getattr(exc, "code", None)
+        type_ = getattr(exc, "type", None)
+        message = (getattr(exc, "message", "") or str(exc)).lower()
+
+        if status == 401 or code in AUTH_CODES:
+            return (KIND_AUTH, provider, auth_text)
+        if _is_quota(code, type_, message):
+            return (KIND_QUOTA, provider, quota_text)
+        # Прочие 429 — обычный rate limit, SDK ретраит сам. Не алертим.
 
     return None
 
