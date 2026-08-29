@@ -4,24 +4,43 @@
 Интерфейс (CallAnalysis, AnalysisService, format_note) сохранён для совместимости с main.py.
 """
 import anthropic
+import httpx
 import json
 import logging
+import openai
 import re
 import os
+import time
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 from config import (
     ANTHROPIC_API_KEY,
     ANTHROPIC_MODEL,
+    ASSEMBLYAI_API_KEY,
+    ASSEMBLYAI_LLM_MODEL,
+    LLM_CHAIN,
+    LLM_FALLBACK_ENABLED,
+    LLM_FALLBACK_RETRY_MINUTES,
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
     OPENAI_MAX_TOKENS,
     ANALYSIS_PIPELINE_VERSION,
     MAX_TRANSCRIPT_LENGTH,
     TRUNCATE_TRANSCRIPT_FOR_ANALYSIS,
 )
+from services.telegram import telegram_service
 
 logger = logging.getLogger(__name__)
 
 _anthropic_client: anthropic.AsyncAnthropic | None = None
+_openai_client: "openai.AsyncOpenAI | None" = None
+
+# Человекочитаемые названия для уведомлений
+LLM_PROVIDER_TITLES = {
+    "anthropic": "Anthropic (Claude)",
+    "assemblyai": "AssemblyAI (Claude через их шлюз)",
+    "openai": "OpenAI (GPT)",
+}
 
 
 def _normalize_list_field(value) -> List[str]:
@@ -491,6 +510,10 @@ def _extract_json_from_text(text: str) -> dict:
 class AnalysisService:
     """Сервис анализа разговоров через Claude Sonnet 4.6 с валидацией"""
 
+    def __init__(self):
+        # провайдер -> unix ts, до которого он считается недоступным
+        self._llm_down_until: Dict[str, float] = {}
+
     @staticmethod
     def _clamp_confidence(value: Any) -> float:
         try:
@@ -609,37 +632,187 @@ class AnalysisService:
             )
         return result
 
-    async def _call_claude(
+    # -------------------------------------------------------------------------
+    # Цепочка LLM-провайдеров: anthropic → assemblyai → openai
+    # -------------------------------------------------------------------------
+
+    def _llm_available(self, provider: str) -> bool:
+        """Провайдер не в «карантине» после недавнего инфраструктурного сбоя?"""
+        return time.time() >= self._llm_down_until.get(provider, 0.0)
+
+    @staticmethod
+    def _is_llm_infra_failure(exc: BaseException) -> bool:
+        """Сбой, который сам не пройдёт: кончились деньги или отозван ключ."""
+        # Импорт здесь: services.alerts тянет telegram → config, на уровне
+        # модуля получился бы цикл импортов.
+        from services import alerts
+
+        if alerts.classify(exc) is not None:
+            return True
+        # LLM Gateway AssemblyAI отвечает обычным HTTP, не через SDK провайдера
+        msg = str(exc).lower()
+        if isinstance(exc, httpx.HTTPStatusError):
+            if exc.response.status_code in (401, 402, 403):
+                return True
+            if exc.response.status_code == 429 and "quota" in msg:
+                return True
+        return any(h in msg for h in ("insufficient", "credit balance", "no credits", "billing"))
+
+    async def _llm_mark_down(self, provider: str, exc: BaseException):
+        """Помечает провайдера недоступным и уведомляет — один раз на сбой."""
+        first_time = self._llm_available(provider)
+        self._llm_down_until[provider] = time.time() + LLM_FALLBACK_RETRY_MINUTES * 60
+        if not first_time:
+            return
+
+        nxt = [p for p in LLM_CHAIN if p != provider and self._llm_available(p)]
+        target = LLM_PROVIDER_TITLES.get(nxt[0], nxt[0]) if nxt else "—"
+        logger.error(f"🔁 LLM {provider} недоступен ({exc}) — переходим на {target}")
+        try:
+            await telegram_service.send_message(
+                "🔁 <b>Переключение анализа на резерв</b>\n\n"
+                f"<b>Не отвечает:</b> {LLM_PROVIDER_TITLES.get(provider, provider)}\n"
+                "Вероятно, кончился баланс или отозван ключ.\n\n"
+                f"<b>Анализ идёт через:</b> {target}\n"
+                f"<i>Основной провайдер проверим снова через {LLM_FALLBACK_RETRY_MINUTES} мин.</i>"
+            )
+        except Exception as tg_err:
+            logger.warning(f"⚠️ Не удалось отправить алерт о переключении LLM: {tg_err}")
+
+    async def _llm_recovered(self, provider: str):
+        """Основной провайдер ожил — снимаем карантин и сообщаем."""
+        if not self._llm_down_until.pop(provider, None):
+            return
+        logger.info(f"✅ LLM {provider} снова доступен")
+        try:
+            await telegram_service.send_message(
+                "✅ <b>Анализ вернулся на основной провайдер</b>\n\n"
+                f"<b>Провайдер:</b> {LLM_PROVIDER_TITLES.get(provider, provider)}\n"
+                "Качество сводок восстановлено."
+            )
+        except Exception as tg_err:
+            logger.warning(f"⚠️ Не удалось отправить уведомление о возврате LLM: {tg_err}")
+
+    async def _call_llm(
         self,
         system_prompt: str,
         user_prompt: str,
         max_tokens: int = 2500,
     ) -> str:
         """
-        Универсальный вызов Claude API.
-        Возвращает текст ответа.
-        """
-        client = _get_anthropic_client()
-        model = ANTHROPIC_MODEL
+        Вызов LLM с автопереходом по цепочке LLM_CHAIN.
 
-        response = await client.messages.create(
-            model=model,
+        Переключаемся только на инфраструктурных сбоях (баланс, ключ) — обычные
+        ошибки (сеть, таймаут, кривой ответ) пробрасываем наверх: уводить весь
+        анализ на резерв из-за одного плохого звонка неправильно.
+        """
+        chain = LLM_CHAIN if LLM_FALLBACK_ENABLED else LLM_CHAIN[:1]
+        callers = {
+            "anthropic": self._call_anthropic,
+            "assemblyai": self._call_assemblyai_llm,
+            "openai": self._call_openai_llm,
+        }
+
+        errors = []
+        skipped = []
+        for provider in chain:
+            caller = callers.get(provider)
+            if caller is None:
+                logger.warning(f"⚠️ Неизвестный LLM-провайдер в цепочке: {provider}")
+                continue
+            if not self._llm_available(provider):
+                skipped.append(provider)
+                continue
+            try:
+                text = await caller(system_prompt, user_prompt, max_tokens)
+                await self._llm_recovered(provider)
+                return text
+            except Exception as exc:
+                if not self._is_llm_infra_failure(exc):
+                    raise
+                errors.append(f"{provider}: {str(exc)[:120]}")
+                await self._llm_mark_down(provider, exc)
+
+        # Ни один не ответил. Если кого-то пропустили по карантину — пробуем
+        # их всё равно: лучше рискнуть, чем оставить звонок без анализа.
+        for provider in skipped:
+            try:
+                text = await callers[provider](system_prompt, user_prompt, max_tokens)
+                await self._llm_recovered(provider)
+                return text
+            except Exception as exc:
+                errors.append(f"{provider} (повтор): {str(exc)[:120]}")
+
+        raise RuntimeError("Все LLM-провайдеры недоступны — " + "; ".join(errors))
+
+    async def _call_anthropic(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+        """Anthropic напрямую (основной провайдер)."""
+        response = await _get_anthropic_client().messages.create(
+            model=ANTHROPIC_MODEL,
             max_tokens=max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
-
-        result_text = response.content[0].text
-
-        input_tokens = response.usage.input_tokens
-        output_tokens = response.usage.output_tokens
-        cost_estimate = (input_tokens / 1_000_000 * 3.0) + (output_tokens / 1_000_000 * 15.0)
+        usage = response.usage
         logger.info(
-            f"Claude call done: {input_tokens} in / {output_tokens} out, "
-            f"~${cost_estimate:.4f}, model={model}"
+            f"LLM anthropic/{ANTHROPIC_MODEL}: {usage.input_tokens} in / {usage.output_tokens} out"
         )
+        return response.content[0].text
 
-        return result_text
+    async def _call_assemblyai_llm(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+        """
+        LLM Gateway AssemblyAI — OpenAI-совместимый API.
+        Даёт ту же модель claude-sonnet-4-6, но с оплатой через AssemblyAI,
+        поэтому пустой баланс Anthropic его не затрагивает.
+        """
+        if not ASSEMBLYAI_API_KEY:
+            raise RuntimeError("ASSEMBLYAI_API_KEY не задан")
+
+        async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+            r = await client.post(
+                "https://llm-gateway.assemblyai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {ASSEMBLYAI_API_KEY}"},
+                json={
+                    "model": ASSEMBLYAI_LLM_MODEL,
+                    "max_tokens": max_tokens,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        usage = data.get("usage") or {}
+        logger.info(
+            f"LLM assemblyai/{ASSEMBLYAI_LLM_MODEL}: "
+            f"{usage.get('input_tokens', '?')} in / {usage.get('output_tokens', '?')} out"
+        )
+        return data["choices"][0]["message"]["content"]
+
+    async def _call_openai_llm(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+        """OpenAI напрямую — последнее звено цепочки."""
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY не задан")
+
+        global _openai_client
+        if _openai_client is None:
+            _openai_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+        response = await _openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            max_completion_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        usage = response.usage
+        logger.info(
+            f"LLM openai/{OPENAI_MODEL}: {usage.prompt_tokens} in / {usage.completion_tokens} out"
+        )
+        return response.choices[0].message.content or ""
 
     async def _verify_with_claude(
         self,
@@ -665,7 +838,7 @@ class AnalysisService:
                 transcript=prepared_transcript,
             )
 
-            result_text = await self._call_claude(
+            result_text = await self._call_llm(
                 system_prompt=FACT_VERIFIER_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 max_tokens=1200,
@@ -692,7 +865,7 @@ class AnalysisService:
         Один вызов Claude, без валидатора/верификатора: текст диалога точен,
         в отличие от расшифровки звука.
         """
-        result_text = await self._call_claude(
+        result_text = await self._call_llm(
             system_prompt=CHAT_ANALYSIS_SYSTEM_PROMPT,
             user_prompt=f"Канал: {channel_name}\n\nПЕРЕПИСКА:\n{dialog_text}",
             max_tokens=1500,
@@ -762,7 +935,7 @@ class AnalysisService:
         try:
             prepared_transcript = self._prepare_transcript(transcript)
 
-            result_text = await self._call_claude(
+            result_text = await self._call_llm(
                 system_prompt=VALIDATOR_SYSTEM_PROMPT,
                 user_prompt=VALIDATOR_USER_PROMPT.format(
                     missing_fields=", ".join(missing_fields),
@@ -908,7 +1081,7 @@ class AnalysisService:
 
             for attempt in range(max_retries):
                 try:
-                    result_text = await self._call_claude(
+                    result_text = await self._call_llm(
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         max_tokens=max_tokens,

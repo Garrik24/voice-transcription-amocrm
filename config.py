@@ -51,8 +51,32 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-# ============== LLM provider switch (openai / gemini / anthropic) ==============
-# openai | gemini | anthropic
+# ============== Цепочка провайдеров анализа (LLM) ==============
+# Анализ звонка идёт по цепочке: если у провайдера кончились деньги или отозван
+# ключ — автоматически переходим к следующему, уведомляя в Telegram. Через
+# LLM_FALLBACK_RETRY_MINUTES пробуем вернуться на основной.
+#
+# Порядок по умолчанию: anthropic → assemblyai → openai.
+# assemblyai здесь — не распознавание речи, а LLM Gateway AssemblyAI
+# (llm-gateway.assemblyai.com), где доступна та же модель claude-sonnet-4-6,
+# что и у Anthropic напрямую. Поэтому качество сводок при переключении
+# не падает, а оплата идёт с баланса AssemblyAI.
+LLM_CHAIN = [
+    p.strip().lower()
+    for p in os.getenv("LLM_CHAIN", "anthropic,assemblyai,openai").split(",")
+    if p.strip()
+]
+
+# Автопереключение по цепочке. false — работает только первый провайдер.
+LLM_FALLBACK_ENABLED = os.getenv("LLM_FALLBACK_ENABLED", "true").strip().lower() == "true"
+
+# Через сколько минут пробовать вернуться на основной провайдер
+LLM_FALLBACK_RETRY_MINUTES = int(os.getenv("LLM_FALLBACK_RETRY_MINUTES", "30"))
+
+# Модель в LLM Gateway AssemblyAI (список: GET llm-gateway.assemblyai.com/v1/models)
+ASSEMBLYAI_LLM_MODEL = os.getenv("ASSEMBLYAI_LLM_MODEL", "claude-sonnet-4-6")
+
+# Устаревшая настройка: в рабочем коде не используется, оставлена для скриптов.
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
 
 # Модели (можно переопределить в Railway Variables)
