@@ -13,6 +13,24 @@ from config import AMOCRM_DOMAIN, AMOCRM_ACCESS_TOKEN, AMOCRM_VERIFY_SSL, MANAGE
 logger = logging.getLogger(__name__)
 
 
+# Префиксы, по которым автозадача этого сервиса отличается от задачи,
+# которую менеджер завёл руками. Переписывать чужую задачу нельзя — это
+# единственный признак авторства, доступный без хранения своего состояния.
+# «Связаться с клиентом по итогам звонка (AI)» — снятая заглушка старого кода:
+# оставлена в списке, чтобы уже висящие в CRM задачи-пустышки тоже подхватывались.
+AUTO_TASK_PREFIXES = (
+    "По итогам звонка (AI)",
+    "Перезвонить: пропущенный звонок",
+    "Связаться с клиентом по итогам звонка (AI)",
+)
+
+
+def is_auto_task(task: Dict[str, Any]) -> bool:
+    """Задача создана этим сервисом (а не менеджером вручную)?"""
+    text = (task.get("text") or "").lstrip()
+    return text.startswith(AUTO_TASK_PREFIXES)
+
+
 class AmoCRMService:
     """Класс для работы с AmoCRM API"""
     
@@ -131,39 +149,75 @@ class AmoCRMService:
             logger.error(f"❌ Не удалось закрыть сделку #{lead_id} как спам: {err}")
         return ok
 
-    async def complete_task(self, task_id: int, result_text: str = "") -> bool:
-        """Завершает задачу с текстом результата."""
+    async def patch_task(self, task_id: int, payload: dict) -> bool:
+        """
+        PATCH одной задачи. Батч-PATCH по /tasks не используем сознательно:
+        при частичной ошибке amoCRM не говорит, какие задачи применились.
+        """
         try:
             async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
                 response = await client.patch(
                     f"{self.base_url}/tasks/{task_id}",
                     headers=self.headers,
-                    json={"is_completed": True, "result": {"text": result_text or "Выполнено"}},
+                    json=payload,
                 )
                 response.raise_for_status()
                 return True
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ Ошибка обновления задачи #{task_id}: {e} | {e.response.text[:300]}")
+            return False
         except Exception as e:
-            logger.error(f"❌ Ошибка завершения задачи #{task_id}: {e}")
+            logger.error(f"❌ Ошибка обновления задачи #{task_id}: {e}")
             return False
 
+    async def complete_task(self, task_id: int, result_text: str = "") -> bool:
+        """Завершает задачу с текстом результата."""
+        return await self.patch_task(
+            task_id,
+            {"is_completed": True, "result": {"text": result_text or "Выполнено"}},
+        )
+
+    async def update_task(
+        self,
+        task_id: int,
+        text: str,
+        complete_till: int,
+        responsible_user_id: Optional[int] = None,
+    ) -> bool:
+        """Обновляет текст и срок существующей задачи."""
+        payload = {"text": (text or "").strip()[:500], "complete_till": int(complete_till)}
+        if responsible_user_id:
+            payload["responsible_user_id"] = int(responsible_user_id)
+        return await self.patch_task(task_id, payload)
+
+    async def fetch_open_tasks(self, lead_id: int) -> list:
+        """
+        Открытые задачи сделки. В отличие от get_open_tasks — пробрасывает ошибку.
+        Нужен ensure_task: пустой список из-за сбоя API там неотличим от «задач нет»,
+        и сервис молча наплодил бы дубли вместо обновления существующей.
+        """
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            response = await client.get(
+                f"{self.base_url}/tasks",
+                headers=self.headers,
+                params={
+                    "filter[entity_type]": "leads",
+                    "filter[entity_id]": lead_id,
+                    "filter[is_completed]": 0,
+                    # 04.09.2026 на одной сделке висело 15 открытых задач — берём с запасом,
+                    # иначе ensure_task будет разгребать дубли по 10 штук за проход
+                    "limit": 50,
+                },
+            )
+            if response.status_code == 204:
+                return []
+            response.raise_for_status()
+            return response.json().get("_embedded", {}).get("tasks", [])
+
     async def get_open_tasks(self, lead_id: int) -> list:
-        """Открытые (невыполненные) задачи сделки."""
+        """Открытые (невыполненные) задачи сделки. При ошибке API — пустой список."""
         try:
-            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
-                response = await client.get(
-                    f"{self.base_url}/tasks",
-                    headers=self.headers,
-                    params={
-                        "filter[entity_type]": "leads",
-                        "filter[entity_id]": lead_id,
-                        "filter[is_completed]": 0,
-                        "limit": 10,
-                    },
-                )
-                if response.status_code == 204:
-                    return []
-                response.raise_for_status()
-                return response.json().get("_embedded", {}).get("tasks", [])
+            return await self.fetch_open_tasks(lead_id)
         except Exception as e:
             logger.warning(f"⚠️ get_open_tasks({lead_id}): {e}")
             return []
@@ -175,8 +229,11 @@ class AmoCRMService:
         complete_till: int,
         responsible_user_id: Optional[int] = None,
         task_type_id: int = 1,
-    ) -> bool:
-        """Создаёт задачу, привязанную к сделке (task_type_id=1 — «Связаться»)."""
+    ) -> Optional[int]:
+        """
+        Создаёт задачу, привязанную к сделке (task_type_id=1 — «Связаться»).
+        Возвращает id созданной задачи или None при ошибке.
+        """
         payload = {
             "task_type_id": task_type_id,
             "text": text,
@@ -194,14 +251,75 @@ class AmoCRMService:
                     json=[payload],
                 )
                 response.raise_for_status()
-                logger.info(f"✅ Задача создана для сделки #{lead_id} (срок {complete_till})")
-                return True
+                task_id = response.json()["_embedded"]["tasks"][0]["id"]
+                logger.info(f"✅ Задача #{task_id} создана для сделки #{lead_id} (срок {complete_till})")
+                return int(task_id)
         except httpx.HTTPStatusError as e:
             logger.error(f"❌ Ошибка создания задачи для #{lead_id}: {e} | {e.response.text[:300]}")
-            return False
+            return None
         except Exception as e:
             logger.error(f"❌ Ошибка создания задачи для #{lead_id}: {e}")
-            return False
+            return None
+
+    async def ensure_task(
+        self,
+        lead_id: int,
+        text: str,
+        complete_till: int,
+        responsible_user_id: Optional[int] = None,
+        task_type_id: int = 1,
+    ) -> Optional[dict]:
+        """
+        Единая точка постановки задач: на сделке остаётся одна открытая задача.
+
+        Открытая задача менеджера → не трогаем ничего. Ручную задачу нельзя ни
+        переписать, ни закрыть как дубль: менеджер завёл её осознанно, и молча
+        подменить ей текст — хуже, чем не поставить свою.
+        Только свои автозадачи → обновляем самую раннюю по сроку, остальные
+        закрываем как дубли (PATCH по одной задаче, не батчем).
+        Открытых нет → создаём.
+
+        Возвращает {"action": "created"|"updated"|"skipped", "task_id": int|None}
+        либо None, если задачу поставить не удалось. Список задач не прочитался —
+        тоже None: создавать «на всякий случай» нельзя, так и появляются дубли.
+        """
+        try:
+            open_tasks = await self.fetch_open_tasks(lead_id)
+        except Exception as e:
+            logger.error(f"❌ ensure_task({lead_id}): не удалось прочитать открытые задачи: {e}")
+            return None
+
+        text = (text or "").strip()[:500]
+        complete_till = int(complete_till)
+
+        manual = [t for t in open_tasks if not is_auto_task(t)]
+        if manual:
+            logger.info(
+                f"⏭️ Сделка #{lead_id}: есть ручная задача #{manual[0].get('id')} — не трогаем"
+            )
+            return {"action": "skipped", "task_id": manual[0].get("id")}
+
+        if not open_tasks:
+            task_id = await self.create_task(
+                lead_id, text, complete_till, responsible_user_id, task_type_id
+            )
+            return {"action": "created", "task_id": task_id} if task_id else None
+
+        ordered = sorted(open_tasks, key=lambda t: t.get("complete_till") or 0)
+        keep, dupes = ordered[0], ordered[1:]
+
+        if not await self.update_task(keep["id"], text, complete_till, responsible_user_id):
+            return None
+        logger.info(f"♻️ Задача #{keep['id']} по сделке #{lead_id} обновлена (срок {complete_till})")
+
+        for d in dupes:
+            await self.complete_task(
+                d["id"], "Закрыто как дубль: по сделке одна открытая задача"
+            )
+        if dupes:
+            logger.info(f"🧹 Сделка #{lead_id}: закрыто дублей — {len(dupes)}")
+
+        return {"action": "updated", "task_id": keep["id"]}
 
     async def get_recent_calls(self, minutes: int = 10) -> list:
         """

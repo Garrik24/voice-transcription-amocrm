@@ -728,56 +728,91 @@ def _parse_next_contact_ts(text: str, now_utc: Optional[datetime] = None) -> Opt
     return None
 
 
+# Маркер авторства в тексте задачи. Без него сервис не отличит свою задачу от
+# заведённой менеджером вручную и при обновлении затрёт чужой текст —
+# см. AUTO_TASK_PREFIXES в services/amocrm.py.
+AUTO_TASK_MARKER = "По итогам звонка (AI)"
+
+
+def _manager_steps_from_analysis(analysis) -> list:
+    """Пункты next_steps, адресованные менеджеру, без префикса «Менеджеру:»."""
+    steps = [str(s).strip() for s in (getattr(analysis, "next_steps", None) or []) if str(s).strip()]
+    out = []
+    for s in steps:
+        if s.lower().startswith("менеджеру"):
+            cleaned = re.sub(r"^менеджеру\s*[:—-]?\s*", "", s, flags=re.IGNORECASE).strip()
+            if cleaned:
+                out.append(cleaned)
+    return out[:3]
+
+
 async def _create_followup_task(lead_id: int, analysis, responsible_user_id: Optional[int]):
     """
-    Ставит менеджеру задачу по итогам звонка: текст — из next_steps (пункты «Менеджеру:»),
-    срок — из next_contact_date (не распознали → завтра 10:00 МСК).
-    Дубли не плодим: если у сделки уже есть открытая задача — пропускаем.
+    Ставит менеджеру задачу по итогам разговора — только когда есть договорённость.
+    Раньше задача создавалась на каждый анализ, и при пустых next_steps в CRM улетало
+    «Связаться с клиентом по итогам звонка (AI)»: 04.09.2026 таких висело 7 штук,
+    а всего автозадач — 197 из 200 открытых.
+
+    Решает LLM (needs_task + task_text). Если блока в ответе нет вообще — работает
+    запасное правило: пункт «Менеджеру: …» в next_steps или названная дата следующего
+    контакта. Иначе потеря блока в промпте молча выключила бы задачи целиком.
+
+    Срок: распознанная фраза next_contact_date («в пятницу», «15 марта») — как есть,
+    это договорённость с клиентом. Не распознали — due_in_hours от LLM, и вот его уже
+    прижимаем к рабочему окну.
+
+    Дублей не плодим: ensure_task держит на сделке одну открытую задачу и не трогает
+    задачи, заведённые менеджером вручную.
     """
     try:
-        open_tasks = await amocrm_service.get_open_tasks(lead_id)
-        if open_tasks:
-            logger.info(f"⏭️ Задача не создана: у сделки #{lead_id} уже есть открытая задача (#{open_tasks[0].get('id')})")
-            return
-
-        steps = [s.strip() for s in (getattr(analysis, "next_steps", None) or []) if str(s).strip()]
-        manager_steps = []
-        for s in steps:
-            low = s.lower()
-            if low.startswith("менеджеру"):
-                cleaned = re.sub(r"^менеджеру\s*[:—-]?\s*", "", s, flags=re.IGNORECASE).strip()
-                if cleaned:
-                    manager_steps.append(cleaned)
-        lines = manager_steps[:3]
-
         next_contact = (getattr(analysis, "next_contact_date", "") or "").strip()
         has_contact = next_contact.lower() not in ("не указано", "не определено", "не обсуждали", "")
+        needs_task = getattr(analysis, "needs_task", None)
 
-        if lines:
-            text = "По итогам звонка (AI):\n" + "\n".join(f"• {l}" for l in lines)
+        if needs_task is None:
+            manager_steps = _manager_steps_from_analysis(analysis)
+            if not manager_steps and not has_contact:
+                logger.info(f"⏭️ Задача не создана: договорённостей нет (сделка #{lead_id})")
+                return
+            logger.warning(
+                f"⚠️ Сделка #{lead_id}: LLM не вернул needs_task — решаем по next_steps"
+            )
+            body = "; ".join(manager_steps) if manager_steps else f"перезвонить {next_contact}"
+        elif not needs_task:
+            logger.info(f"⏭️ Задача не создана: договорённостей нет (сделка #{lead_id})")
+            return
         else:
-            text = "Связаться с клиентом по итогам звонка (AI)"
+            body = (getattr(analysis, "task_text", "") or "").strip()
+            if not body:
+                logger.warning(
+                    f"⏭️ Сделка #{lead_id}: needs_task=true, но текст пустой — задача не ставится"
+                )
+                return
+
+        text = f"{AUTO_TASK_MARKER}: {body}"
         if has_contact:
             text += f"\nСлед. контакт: {next_contact}"
 
         complete_till = _parse_next_contact_ts(next_contact)
         if complete_till is None:
-            # завтра 10:00 МСК
-            tomorrow = datetime.now(_MSK_TZ).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-            complete_till = int(tomorrow.replace(hour=10).timestamp())
+            hours = getattr(analysis, "due_in_hours", 24) or 24
+            complete_till = _snap_to_work_hours(int(time.time()) + hours * 3600)
 
-        ok = await amocrm_service.create_task(
+        result = await amocrm_service.ensure_task(
             lead_id=lead_id,
             text=text[:500],
             complete_till=complete_till,
             responsible_user_id=responsible_user_id,
         )
-        if ok:
+        if result and result["action"] != "skipped":
             due = datetime.fromtimestamp(complete_till, _MSK_TZ)
-            logger.info(f"📋 Задача менеджеру по сделке #{lead_id}: срок {due:%d.%m %H:%M} МСК")
+            verb = "создана" if result["action"] == "created" else "обновлена"
+            logger.info(
+                f"📋 Задача #{result['task_id']} по сделке #{lead_id} {verb}: срок {due:%d.%m %H:%M} МСК"
+            )
     except Exception as e:
         # Задача — вишенка, не роняем пайплайн
-        logger.error(f"❌ Ошибка создания авто-задачи для #{lead_id}: {e}")
+        logger.error(f"❌ Ошибка постановки авто-задачи для #{lead_id}: {e}")
 
 
 # ============== Догоняющий цикл: подхват звонков, потерянных вебхуком ==============
@@ -820,14 +855,27 @@ def _norm_phone(phone: str) -> str:
     return digits[-10:] if len(digits) >= 10 else digits
 
 
+def _snap_to_work_hours(ts: int, start_h: int = 9, end_h: int = 18) -> int:
+    """
+    Прижимает срок задачи к рабочему окну 9–18 МСК: после конца дня или в выходной →
+    следующий рабочий день 10:00, до начала дня → сегодня 10:00.
+
+    Выходные пропускаем циклом, а не одним «+1 день»: пятница 19:00 без этого
+    превращалась в субботу 10:00, и задача протухала ещё до того, как её кто-то увидел.
+    """
+    d = datetime.fromtimestamp(int(ts), _MSK_TZ)
+    if d.weekday() >= 5 or d.hour >= end_h:
+        d = (d + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+    elif d.hour < start_h:
+        d = d.replace(hour=10, minute=0, second=0, microsecond=0)
+    return int(d.timestamp())
+
+
 def _next_work_slot_ts() -> int:
     """Срок задачи «перезвонить»: через час, но в рабочее окно 9–18 МСК."""
-    t = datetime.now(_MSK_TZ) + timedelta(hours=1)
-    if t.hour >= 18:
-        t = (t + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
-    elif t.hour < 9:
-        t = t.replace(hour=10, minute=0, second=0, microsecond=0)
-    return int(t.timestamp())
+    return _snap_to_work_hours(int(time.time()) + 3600)
 
 
 async def _missed_calls_pass(all_calls: list, now: int):
@@ -858,9 +906,10 @@ async def _missed_calls_pass(all_calls: list, now: int):
         if not lead_id or lead_id in _SPAM_HANDLED:
             _MISSED_HANDLED.add(nid)
             continue
-        # Guard, переживающий рестарт: наша задача уже стоит на сделке
-        open_tasks = await amocrm_service.get_open_tasks(lead_id)
-        if any("пропущенный звонок" in (t.get("text") or "").lower() for t in open_tasks):
+        # Guard, переживающий рестарт. Пропускаем при ЛЮБОЙ открытой задаче, а не только
+        # при своей: если менеджеру уже есть что делать по сделке, вторая задача про тот же
+        # контакт — шум. Правило «одна открытая задача на сделку» здесь важнее полноты.
+        if await amocrm_service.get_open_tasks(lead_id):
             _MISSED_HANDLED.add(nid)
             continue
         when = datetime.fromtimestamp(c["created_at"], _MSK_TZ).strftime("%H:%M")
