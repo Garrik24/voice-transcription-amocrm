@@ -84,6 +84,50 @@ def _get_anthropic_client() -> anthropic.AsyncAnthropic:
     return _anthropic_client
 
 
+# Срок задачи по умолчанию и потолок: «через год» от LLM — это не срок, а мусор
+DEFAULT_TASK_DUE_HOURS = 24
+MAX_TASK_DUE_HOURS = 720  # 30 дней
+
+
+def _parse_task_decision(data: Dict[str, Any]) -> tuple:
+    """
+    Разбирает блок решения о задаче из ответа LLM → (needs_task, task_text, due_in_hours).
+
+    Fail-closed: поля нет, тип не тот, текст пустой, срок бессмысленный — задачи нет.
+    04.09.2026 из 200 открытых задач в amoCRM 197 создала автоматика: молчаливый
+    фолбэк «поставить хоть что-нибудь» обходится дороже, чем пропущенная задача.
+    Исключение здесь не бросаем — примечание в сделку важнее задачи.
+    """
+    raw = data.get("needs_task")
+    if raw is None:
+        logger.warning("⚠️ LLM не вернул needs_task — задача не ставится")
+        return False, "", DEFAULT_TASK_DUE_HOURS
+
+    if isinstance(raw, str):
+        needs = raw.strip().lower() in ("true", "yes", "да", "1")
+    else:
+        needs = bool(raw)
+    if not needs:
+        return False, "", DEFAULT_TASK_DUE_HOURS
+
+    text = str(data.get("task_text") or "").strip()
+    if not text:
+        logger.warning("⚠️ needs_task=true, но task_text пустой — задача не ставится")
+        return False, "", DEFAULT_TASK_DUE_HOURS
+
+    raw_hours = data.get("due_in_hours")
+    try:
+        hours = int(raw_hours) if raw_hours not in (None, "") else DEFAULT_TASK_DUE_HOURS
+    except (TypeError, ValueError):
+        logger.warning(f"⚠️ due_in_hours={raw_hours!r} — не число, берём {DEFAULT_TASK_DUE_HOURS} ч")
+        hours = DEFAULT_TASK_DUE_HOURS
+    if not 1 <= hours <= MAX_TASK_DUE_HOURS:
+        logger.warning(f"⚠️ due_in_hours={hours} вне 1..{MAX_TASK_DUE_HOURS} — берём {DEFAULT_TASK_DUE_HOURS} ч")
+        hours = DEFAULT_TASK_DUE_HOURS
+
+    return True, text[:250], hours
+
+
 @dataclass
 class CallAnalysis:
     """Результат анализа звонка (без оценок)"""
@@ -99,6 +143,10 @@ class CallAnalysis:
     call_result: str  # Итог звонка
     next_contact_date: str  # Когда связаться
     next_steps: List[str]  # Следующие шаги для менеджера (0-5)
+    # Решение о задаче менеджеру. По умолчанию задачи нет: см. _parse_task_decision
+    needs_task: bool = False  # Есть ли договорённость, требующая действия с нашей стороны
+    task_text: str = ""  # Формулировка задачи (пусто, если needs_task=False)
+    due_in_hours: int = DEFAULT_TASK_DUE_HOURS  # Через сколько часов срок
     speaker_stats: Optional["SpeakerStats"] = None  # Метрики по участникам (v2)
 
 
@@ -278,7 +326,27 @@ location:
   находится ОБЪЕКТ работ (село, посёлок, станица, хутор) — укажи его: "с. Верхняя Татарка".
   "Не указано" — только если в разговоре нет вообще никакой географической привязки объекта.
 
-6. Формат ответа
+6. Решение о задаче менеджеру (needs_task)
+Задача ставится НЕ на каждый звонок, а только когда есть что делать.
+
+needs_task = true ТОЛЬКО если в разговоре есть конкретная договорённость,
+требующая действия с НАШЕЙ стороны: перезвонить в согласованное время,
+отправить КП/договор/документы, выехать на объект, дождаться данных от клиента
+и вернуться к нему.
+
+needs_task = false если: разговор информационный, без договорённостей; клиент отказался;
+звонок не по теме; спам; ошиблись номером; клиент сказал «сам перезвоню» без даты;
+мяч на стороне клиента и от нас ничего не ждут. Тогда task_text = "".
+
+task_text — императив, 3–10 слов, ОБЯЗАТЕЛЬНО с предметом:
+«Отправить КП по межеванию», «Перезвонить по геологии после 15:00».
+Формулировка без предмета («Связаться с клиентом», «Перезвонить») задачей не считается —
+в таком случае ставь needs_task = false.
+
+due_in_hours — из договорённости: «сегодня вечером» = 4, «завтра» = 24,
+«через пару дней» = 48, «на следующей неделе» = 120. Срок не назван → 24.
+
+7. Формат ответа
 Верни ТОЛЬКО валидный JSON. Никакого текста до или после JSON.
 {{{{
   "client_name": "string",
@@ -291,7 +359,10 @@ location:
   "payment_terms": "string",
   "call_result": "string",
   "next_contact_date": "string",
-  "next_steps": ["string"]
+  "next_steps": ["string"],
+  "needs_task": true,
+  "task_text": "string",
+  "due_in_hours": 24
 }}}}"""
 
 
@@ -397,6 +468,17 @@ CHAT_ANALYSIS_SYSTEM_PROMPT = """Ты — аналитик переписки г
 - summary — суть диалога, 2-4 предложения.
 - client_name — имя клиента, если видно из диалога/подписи; иначе "Клиент".
 
+Решение о задаче менеджеру:
+- needs_task = true ТОЛЬКО если в переписке есть конкретная договорённость, требующая
+  действия с НАШЕЙ стороны: перезвонить, отправить КП/договор/документы, выехать на объект,
+  вернуться к клиенту с данными.
+- needs_task = false если диалог информационный, клиент отказался, это спам/не по теме,
+  или мяч на стороне клиента. Тогда task_text = "".
+- task_text — императив, 3–10 слов, обязательно с предметом: «Отправить КП по межеванию».
+  Формулировка без предмета («Связаться с клиентом») — это needs_task = false.
+- due_in_hours — из договорённости: «сегодня» = 4, «завтра» = 24, «на следующей неделе» = 120.
+  Срок не назван → 24.
+
 Верни ТОЛЬКО валидный JSON:
 {
   "client_name": "string",
@@ -408,7 +490,10 @@ CHAT_ANALYSIS_SYSTEM_PROMPT = """Ты — аналитик переписки г
   "payment_terms": "string",
   "call_result": "string",
   "next_contact_date": "string",
-  "next_steps": ["string"]
+  "next_steps": ["string"],
+  "needs_task": true,
+  "task_text": "string",
+  "due_in_hours": 24
 }"""
 
 
@@ -874,6 +959,7 @@ class AnalysisService:
         next_steps = data.get("next_steps") or []
         if not isinstance(next_steps, list):
             next_steps = _normalize_list_field(next_steps)
+        needs_task, task_text, due_in_hours = _parse_task_decision(data)
         return CallAnalysis(
             client_name=data.get("client_name", "Клиент"),
             manager_name="Менеджер",
@@ -886,6 +972,9 @@ class AnalysisService:
             call_result=data.get("call_result", "Не определено"),
             next_contact_date=data.get("next_contact_date", "Не указано"),
             next_steps=[str(x).strip() for x in next_steps if str(x).strip()][:5],
+            needs_task=needs_task,
+            task_text=task_text,
+            due_in_hours=due_in_hours,
         )
 
     def _apply_verification(
@@ -1117,6 +1206,8 @@ class AnalysisService:
             if not isinstance(next_steps, list):
                 next_steps = []
 
+            needs_task, task_text, due_in_hours = _parse_task_decision(result_json)
+
             # Имя менеджера известно из CRM (responsible_user_id → имя пользователя) —
             # это достоверный источник. LLM регулярно возвращает "Не представился",
             # даже когда имя звучит в разговоре, и затирает им хорошее значение.
@@ -1139,6 +1230,9 @@ class AnalysisService:
                 call_result=result_json.get("call_result", "Не определено"),
                 next_contact_date=result_json.get("next_contact_date", "Не указано"),
                 next_steps=[str(x).strip() for x in next_steps if str(x).strip()][:5],
+                needs_task=needs_task,
+                task_text=task_text,
+                due_in_hours=due_in_hours,
             )
 
             logger.info("✅ Агент 1 (анализ через Claude) завершил работу")

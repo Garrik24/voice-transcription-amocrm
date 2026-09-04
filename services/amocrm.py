@@ -131,39 +131,62 @@ class AmoCRMService:
             logger.error(f"❌ Не удалось закрыть сделку #{lead_id} как спам: {err}")
         return ok
 
-    async def complete_task(self, task_id: int, result_text: str = "") -> bool:
-        """Завершает задачу с текстом результата."""
+    async def patch_task(self, task_id: int, payload: dict) -> bool:
+        """
+        PATCH одной задачи. Батч-PATCH по /tasks не используем сознательно:
+        при частичной ошибке amoCRM не говорит, какие задачи применились.
+        """
         try:
             async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
                 response = await client.patch(
                     f"{self.base_url}/tasks/{task_id}",
                     headers=self.headers,
-                    json={"is_completed": True, "result": {"text": result_text or "Выполнено"}},
+                    json=payload,
                 )
                 response.raise_for_status()
                 return True
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ Ошибка обновления задачи #{task_id}: {e} | {e.response.text[:300]}")
+            return False
         except Exception as e:
-            logger.error(f"❌ Ошибка завершения задачи #{task_id}: {e}")
+            logger.error(f"❌ Ошибка обновления задачи #{task_id}: {e}")
             return False
 
+    async def complete_task(self, task_id: int, result_text: str = "") -> bool:
+        """Завершает задачу с текстом результата."""
+        return await self.patch_task(
+            task_id,
+            {"is_completed": True, "result": {"text": result_text or "Выполнено"}},
+        )
+
+    async def fetch_open_tasks(self, lead_id: int) -> list:
+        """
+        Открытые задачи сделки. В отличие от get_open_tasks — пробрасывает ошибку.
+        Нужен ensure_task: пустой список из-за сбоя API там неотличим от «задач нет»,
+        и сервис молча наплодил бы дубли вместо обновления существующей.
+        """
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            response = await client.get(
+                f"{self.base_url}/tasks",
+                headers=self.headers,
+                params={
+                    "filter[entity_type]": "leads",
+                    "filter[entity_id]": lead_id,
+                    "filter[is_completed]": 0,
+                    # 04.09.2026 на одной сделке висело 15 открытых задач — берём с запасом,
+                    # иначе ensure_task будет разгребать дубли по 10 штук за проход
+                    "limit": 50,
+                },
+            )
+            if response.status_code == 204:
+                return []
+            response.raise_for_status()
+            return response.json().get("_embedded", {}).get("tasks", [])
+
     async def get_open_tasks(self, lead_id: int) -> list:
-        """Открытые (невыполненные) задачи сделки."""
+        """Открытые (невыполненные) задачи сделки. При ошибке API — пустой список."""
         try:
-            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
-                response = await client.get(
-                    f"{self.base_url}/tasks",
-                    headers=self.headers,
-                    params={
-                        "filter[entity_type]": "leads",
-                        "filter[entity_id]": lead_id,
-                        "filter[is_completed]": 0,
-                        "limit": 10,
-                    },
-                )
-                if response.status_code == 204:
-                    return []
-                response.raise_for_status()
-                return response.json().get("_embedded", {}).get("tasks", [])
+            return await self.fetch_open_tasks(lead_id)
         except Exception as e:
             logger.warning(f"⚠️ get_open_tasks({lead_id}): {e}")
             return []
@@ -175,8 +198,11 @@ class AmoCRMService:
         complete_till: int,
         responsible_user_id: Optional[int] = None,
         task_type_id: int = 1,
-    ) -> bool:
-        """Создаёт задачу, привязанную к сделке (task_type_id=1 — «Связаться»)."""
+    ) -> Optional[int]:
+        """
+        Создаёт задачу, привязанную к сделке (task_type_id=1 — «Связаться»).
+        Возвращает id созданной задачи или None при ошибке.
+        """
         payload = {
             "task_type_id": task_type_id,
             "text": text,
@@ -194,14 +220,68 @@ class AmoCRMService:
                     json=[payload],
                 )
                 response.raise_for_status()
-                logger.info(f"✅ Задача создана для сделки #{lead_id} (срок {complete_till})")
-                return True
+                task_id = response.json()["_embedded"]["tasks"][0]["id"]
+                logger.info(f"✅ Задача #{task_id} создана для сделки #{lead_id} (срок {complete_till})")
+                return int(task_id)
         except httpx.HTTPStatusError as e:
             logger.error(f"❌ Ошибка создания задачи для #{lead_id}: {e} | {e.response.text[:300]}")
-            return False
+            return None
         except Exception as e:
             logger.error(f"❌ Ошибка создания задачи для #{lead_id}: {e}")
-            return False
+            return None
+
+    async def ensure_task(
+        self,
+        lead_id: int,
+        text: str,
+        complete_till: int,
+        responsible_user_id: Optional[int] = None,
+        task_type_id: int = 1,
+    ) -> Optional[dict]:
+        """
+        Единая точка постановки задач: на сделке остаётся ровно одна открытая задача.
+
+        Открытых нет  → создаём.
+        Открытые есть → обновляем самую раннюю по сроку (текст/срок/ответственный),
+                        остальные закрываем как дубли — по одной, PATCH на задачу.
+
+        Возвращает {"action": "created"|"updated", "task_id": int} либо None,
+        если задачу поставить не удалось (в т.ч. когда список задач не прочитался —
+        создавать «на всякий случай» нельзя, именно так и появляются дубли).
+        """
+        try:
+            open_tasks = await self.fetch_open_tasks(lead_id)
+        except Exception as e:
+            logger.error(f"❌ ensure_task({lead_id}): не удалось прочитать открытые задачи: {e}")
+            return None
+
+        text = (text or "").strip()[:500]
+        complete_till = int(complete_till)
+
+        if not open_tasks:
+            task_id = await self.create_task(
+                lead_id, text, complete_till, responsible_user_id, task_type_id
+            )
+            return {"action": "created", "task_id": task_id} if task_id else None
+
+        ordered = sorted(open_tasks, key=lambda t: t.get("complete_till") or 0)
+        keep, dupes = ordered[0], ordered[1:]
+
+        payload = {"text": text, "complete_till": complete_till}
+        if responsible_user_id:
+            payload["responsible_user_id"] = int(responsible_user_id)
+        if not await self.patch_task(keep["id"], payload):
+            return None
+        logger.info(f"♻️ Задача #{keep['id']} по сделке #{lead_id} обновлена (срок {complete_till})")
+
+        for d in dupes:
+            await self.complete_task(
+                d["id"], "Закрыто как дубль: по сделке одна открытая задача"
+            )
+        if dupes:
+            logger.info(f"🧹 Сделка #{lead_id}: закрыто дублей — {len(dupes)}")
+
+        return {"action": "updated", "task_id": keep["id"]}
 
     async def get_recent_calls(self, minutes: int = 10) -> list:
         """
