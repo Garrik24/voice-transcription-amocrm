@@ -338,6 +338,24 @@ async def auto_fill_lead_fields(lead_id: int, analysis, call_type_simple: str,
                 })
                 logger.info(f"  📍 Адрес объекта: {location}")
 
+        # 6.5. Дефолты для пустых полей (Игорь, 26.08): Кадастровый инженер — Петков,
+        # Тип Клиента — физлицо. Тип сделки «входящий» по умолчанию обеспечивает блок 3
+        # (по направлению звонка; для чатов — всегда «входящий»). Только в пустые поля.
+        default_selects = {
+            767021: os.getenv("DEFAULT_KAD_ENGINEER", "Петков Александр Анатольевич, тел +79383507400"),
+            212117: os.getenv("DEFAULT_CLIENT_TYPE", "Физическое лицо"),
+        }
+        for fid, default_value in default_selects.items():
+            if fid in existing_fields or not default_value:
+                continue
+            enum_id = await amocrm_service.resolve_enum_id(fid, default_value)
+            if enum_id:
+                custom_fields.append({
+                    "field_id": fid,
+                    "values": [{"enum_id": enum_id}]
+                })
+                logger.info(f"  🧩 Дефолт поля {fid}: {default_value}")
+
         # 7. Название сделки: "{work_type} {location}" — только если текущее дефолтное
         name_to_set = None
         existing_name = lead_data.get("name", "") or ""
