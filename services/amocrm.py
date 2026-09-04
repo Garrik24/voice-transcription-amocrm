@@ -13,6 +13,24 @@ from config import AMOCRM_DOMAIN, AMOCRM_ACCESS_TOKEN, AMOCRM_VERIFY_SSL, MANAGE
 logger = logging.getLogger(__name__)
 
 
+# Префиксы, по которым автозадача этого сервиса отличается от задачи,
+# которую менеджер завёл руками. Переписывать чужую задачу нельзя — это
+# единственный признак авторства, доступный без хранения своего состояния.
+# «Связаться с клиентом по итогам звонка (AI)» — снятая заглушка старого кода:
+# оставлена в списке, чтобы уже висящие в CRM задачи-пустышки тоже подхватывались.
+AUTO_TASK_PREFIXES = (
+    "По итогам звонка (AI)",
+    "Перезвонить: пропущенный звонок",
+    "Связаться с клиентом по итогам звонка (AI)",
+)
+
+
+def is_auto_task(task: Dict[str, Any]) -> bool:
+    """Задача создана этим сервисом (а не менеджером вручную)?"""
+    text = (task.get("text") or "").lstrip()
+    return text.startswith(AUTO_TASK_PREFIXES)
+
+
 class AmoCRMService:
     """Класс для работы с AmoCRM API"""
     
@@ -159,6 +177,19 @@ class AmoCRMService:
             {"is_completed": True, "result": {"text": result_text or "Выполнено"}},
         )
 
+    async def update_task(
+        self,
+        task_id: int,
+        text: str,
+        complete_till: int,
+        responsible_user_id: Optional[int] = None,
+    ) -> bool:
+        """Обновляет текст и срок существующей задачи."""
+        payload = {"text": (text or "").strip()[:500], "complete_till": int(complete_till)}
+        if responsible_user_id:
+            payload["responsible_user_id"] = int(responsible_user_id)
+        return await self.patch_task(task_id, payload)
+
     async def fetch_open_tasks(self, lead_id: int) -> list:
         """
         Открытые задачи сделки. В отличие от get_open_tasks — пробрасывает ошибку.
@@ -239,15 +270,18 @@ class AmoCRMService:
         task_type_id: int = 1,
     ) -> Optional[dict]:
         """
-        Единая точка постановки задач: на сделке остаётся ровно одна открытая задача.
+        Единая точка постановки задач: на сделке остаётся одна открытая задача.
 
-        Открытых нет  → создаём.
-        Открытые есть → обновляем самую раннюю по сроку (текст/срок/ответственный),
-                        остальные закрываем как дубли — по одной, PATCH на задачу.
+        Открытая задача менеджера → не трогаем ничего. Ручную задачу нельзя ни
+        переписать, ни закрыть как дубль: менеджер завёл её осознанно, и молча
+        подменить ей текст — хуже, чем не поставить свою.
+        Только свои автозадачи → обновляем самую раннюю по сроку, остальные
+        закрываем как дубли (PATCH по одной задаче, не батчем).
+        Открытых нет → создаём.
 
-        Возвращает {"action": "created"|"updated", "task_id": int} либо None,
-        если задачу поставить не удалось (в т.ч. когда список задач не прочитался —
-        создавать «на всякий случай» нельзя, именно так и появляются дубли).
+        Возвращает {"action": "created"|"updated"|"skipped", "task_id": int|None}
+        либо None, если задачу поставить не удалось. Список задач не прочитался —
+        тоже None: создавать «на всякий случай» нельзя, так и появляются дубли.
         """
         try:
             open_tasks = await self.fetch_open_tasks(lead_id)
@@ -258,6 +292,13 @@ class AmoCRMService:
         text = (text or "").strip()[:500]
         complete_till = int(complete_till)
 
+        manual = [t for t in open_tasks if not is_auto_task(t)]
+        if manual:
+            logger.info(
+                f"⏭️ Сделка #{lead_id}: есть ручная задача #{manual[0].get('id')} — не трогаем"
+            )
+            return {"action": "skipped", "task_id": manual[0].get("id")}
+
         if not open_tasks:
             task_id = await self.create_task(
                 lead_id, text, complete_till, responsible_user_id, task_type_id
@@ -267,10 +308,7 @@ class AmoCRMService:
         ordered = sorted(open_tasks, key=lambda t: t.get("complete_till") or 0)
         keep, dupes = ordered[0], ordered[1:]
 
-        payload = {"text": text, "complete_till": complete_till}
-        if responsible_user_id:
-            payload["responsible_user_id"] = int(responsible_user_id)
-        if not await self.patch_task(keep["id"], payload):
+        if not await self.update_task(keep["id"], text, complete_till, responsible_user_id):
             return None
         logger.info(f"♻️ Задача #{keep['id']} по сделке #{lead_id} обновлена (срок {complete_till})")
 

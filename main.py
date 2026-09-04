@@ -728,31 +728,69 @@ def _parse_next_contact_ts(text: str, now_utc: Optional[datetime] = None) -> Opt
     return None
 
 
+# Маркер авторства в тексте задачи. Без него сервис не отличит свою задачу от
+# заведённой менеджером вручную и при обновлении затрёт чужой текст —
+# см. AUTO_TASK_PREFIXES в services/amocrm.py.
+AUTO_TASK_MARKER = "По итогам звонка (AI)"
+
+
+def _manager_steps_from_analysis(analysis) -> list:
+    """Пункты next_steps, адресованные менеджеру, без префикса «Менеджеру:»."""
+    steps = [str(s).strip() for s in (getattr(analysis, "next_steps", None) or []) if str(s).strip()]
+    out = []
+    for s in steps:
+        if s.lower().startswith("менеджеру"):
+            cleaned = re.sub(r"^менеджеру\s*[:—-]?\s*", "", s, flags=re.IGNORECASE).strip()
+            if cleaned:
+                out.append(cleaned)
+    return out[:3]
+
+
 async def _create_followup_task(lead_id: int, analysis, responsible_user_id: Optional[int]):
     """
-    Ставит менеджеру задачу по итогам разговора — только когда LLM увидел договорённость
-    (needs_task). Раньше задача создавалась на каждый анализ, и при пустых next_steps
-    в CRM улетало «Связаться с клиентом по итогам звонка (AI)»: 04.09.2026 таких висело
-    7 штук, а всего автозадач — 197 из 200 открытых.
+    Ставит менеджеру задачу по итогам разговора — только когда есть договорённость.
+    Раньше задача создавалась на каждый анализ, и при пустых next_steps в CRM улетало
+    «Связаться с клиентом по итогам звонка (AI)»: 04.09.2026 таких висело 7 штук,
+    а всего автозадач — 197 из 200 открытых.
+
+    Решает LLM (needs_task + task_text). Если блока в ответе нет вообще — работает
+    запасное правило: пункт «Менеджеру: …» в next_steps или названная дата следующего
+    контакта. Иначе потеря блока в промпте молча выключила бы задачи целиком.
 
     Срок: распознанная фраза next_contact_date («в пятницу», «15 марта») — как есть,
     это договорённость с клиентом. Не распознали — due_in_hours от LLM, и вот его уже
     прижимаем к рабочему окну.
 
-    Дублей не плодим: ensure_task оставляет на сделке ровно одну открытую задачу.
+    Дублей не плодим: ensure_task держит на сделке одну открытую задачу и не трогает
+    задачи, заведённые менеджером вручную.
     """
     try:
-        if not getattr(analysis, "needs_task", False):
-            logger.info(f"⏭️ Сделка #{lead_id}: договорённости нет — задача не ставится")
-            return
-
-        text = (getattr(analysis, "task_text", "") or "").strip()
-        if not text:
-            logger.warning(f"⏭️ Сделка #{lead_id}: needs_task=true, но текст пустой — задача не ставится")
-            return
-
         next_contact = (getattr(analysis, "next_contact_date", "") or "").strip()
-        if next_contact.lower() not in ("не указано", "не определено", "не обсуждали", ""):
+        has_contact = next_contact.lower() not in ("не указано", "не определено", "не обсуждали", "")
+        needs_task = getattr(analysis, "needs_task", None)
+
+        if needs_task is None:
+            manager_steps = _manager_steps_from_analysis(analysis)
+            if not manager_steps and not has_contact:
+                logger.info(f"⏭️ Задача не создана: договорённостей нет (сделка #{lead_id})")
+                return
+            logger.warning(
+                f"⚠️ Сделка #{lead_id}: LLM не вернул needs_task — решаем по next_steps"
+            )
+            body = "; ".join(manager_steps) if manager_steps else f"перезвонить {next_contact}"
+        elif not needs_task:
+            logger.info(f"⏭️ Задача не создана: договорённостей нет (сделка #{lead_id})")
+            return
+        else:
+            body = (getattr(analysis, "task_text", "") or "").strip()
+            if not body:
+                logger.warning(
+                    f"⏭️ Сделка #{lead_id}: needs_task=true, но текст пустой — задача не ставится"
+                )
+                return
+
+        text = f"{AUTO_TASK_MARKER}: {body}"
+        if has_contact:
             text += f"\nСлед. контакт: {next_contact}"
 
         complete_till = _parse_next_contact_ts(next_contact)
@@ -766,7 +804,7 @@ async def _create_followup_task(lead_id: int, analysis, responsible_user_id: Opt
             complete_till=complete_till,
             responsible_user_id=responsible_user_id,
         )
-        if result:
+        if result and result["action"] != "skipped":
             due = datetime.fromtimestamp(complete_till, _MSK_TZ)
             verb = "создана" if result["action"] == "created" else "обновлена"
             logger.info(

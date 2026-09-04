@@ -93,15 +93,20 @@ def _parse_task_decision(data: Dict[str, Any]) -> tuple:
     """
     Разбирает блок решения о задаче из ответа LLM → (needs_task, task_text, due_in_hours).
 
-    Fail-closed: поля нет, тип не тот, текст пустой, срок бессмысленный — задачи нет.
+    needs_task: True — есть договорённость, False — нет, None — LLM блок не вернул
+    (тогда решает запасное правило в _create_followup_task).
+
+    Fail-closed: тип не тот, текст пустой, срок бессмысленный — задачи нет.
     04.09.2026 из 200 открытых задач в amoCRM 197 создала автоматика: молчаливый
     фолбэк «поставить хоть что-нибудь» обходится дороже, чем пропущенная задача.
     Исключение здесь не бросаем — примечание в сделку важнее задачи.
     """
     raw = data.get("needs_task")
     if raw is None:
-        logger.warning("⚠️ LLM не вернул needs_task — задача не ставится")
-        return False, "", DEFAULT_TASK_DUE_HOURS
+        # Не False, а «не высказался»: вызывающий код включит запасное правило
+        # по next_steps, иначе потеря блока в промпте молча убила бы все задачи
+        logger.warning("⚠️ LLM не вернул needs_task — решение по запасному правилу")
+        return None, "", DEFAULT_TASK_DUE_HOURS
 
     if isinstance(raw, str):
         needs = raw.strip().lower() in ("true", "yes", "да", "1")
@@ -143,8 +148,8 @@ class CallAnalysis:
     call_result: str  # Итог звонка
     next_contact_date: str  # Когда связаться
     next_steps: List[str]  # Следующие шаги для менеджера (0-5)
-    # Решение о задаче менеджеру. По умолчанию задачи нет: см. _parse_task_decision
-    needs_task: bool = False  # Есть ли договорённость, требующая действия с нашей стороны
+    # Решение о задаче менеджеру: см. _parse_task_decision
+    needs_task: Optional[bool] = None  # Договорённость есть / нет / LLM не высказался
     task_text: str = ""  # Формулировка задачи (пусто, если needs_task=False)
     due_in_hours: int = DEFAULT_TASK_DUE_HOURS  # Через сколько часов срок
     speaker_stats: Optional["SpeakerStats"] = None  # Метрики по участникам (v2)

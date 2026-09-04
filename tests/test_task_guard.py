@@ -83,7 +83,11 @@ class FakeAmo:
         return [(url, kw) for m, url, kw in self.requests if m == method]
 
 
-def _task(task_id, complete_till, text="старый текст"):
+AUTO_TEXT = "По итогам звонка (AI): отправить старое КП"
+MANUAL_TEXT = "Позвонить Петровичу насчёт бетона"
+
+
+def _task(task_id, complete_till, text=AUTO_TEXT):
     return {
         "id": task_id,
         "text": text,
@@ -172,6 +176,59 @@ class TestEnsureTask(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.by_method("PATCH"), [])
 
 
+class TestManualTasksUntouched(unittest.IsolatedAsyncioTestCase):
+    """Задачу, заведённую менеджером руками, сервис не переписывает и не закрывает."""
+
+    async def test_manual_task_blocks_everything(self):
+        fake = FakeAmo(open_tasks=[_task(10, 1_700_000_000, MANUAL_TEXT)])
+        with patch("services.amocrm.httpx.AsyncClient", fake):
+            result = await AmoCRMService().ensure_task(
+                lead_id=1, text="Отправить КП по межеванию", complete_till=1_800_000_000,
+            )
+
+        self.assertEqual(result, {"action": "skipped", "task_id": 10})
+        self.assertEqual(fake.by_method("POST"), [], "новая задача создаваться не должна")
+        self.assertEqual(fake.by_method("PATCH"), [], "чужую задачу не трогаем")
+
+    async def test_manual_task_protects_auto_dupes_from_closing(self):
+        """Смешанный случай: раз есть ручная задача — не трогаем и свои, чтобы не гадать."""
+        fake = FakeAmo(open_tasks=[
+            _task(10, 1_700_000_100, AUTO_TEXT),
+            _task(20, 1_700_000_200, MANUAL_TEXT),
+        ])
+        with patch("services.amocrm.httpx.AsyncClient", fake):
+            result = await AmoCRMService().ensure_task(
+                lead_id=1, text="Отправить КП", complete_till=1_800_000_000,
+            )
+
+        self.assertEqual(result["action"], "skipped")
+        self.assertEqual(fake.by_method("PATCH"), [])
+        self.assertEqual(fake.by_method("POST"), [])
+
+    async def test_missed_call_task_counts_as_auto(self):
+        missed = "Перезвонить: пропущенный звонок с +79181234567 в 14:05, никто не перезвонил"
+        fake = FakeAmo(open_tasks=[_task(10, 1_700_000_000, missed)])
+        with patch("services.amocrm.httpx.AsyncClient", fake):
+            result = await AmoCRMService().ensure_task(
+                lead_id=1, text="Отправить КП", complete_till=1_800_000_000,
+            )
+
+        self.assertEqual(result, {"action": "updated", "task_id": 10})
+        self.assertEqual(len(fake.by_method("PATCH")), 1)
+
+    async def test_legacy_placeholder_counts_as_auto(self):
+        """Заглушки старого кода должны подхватываться, а не считаться ручными."""
+        fake = FakeAmo(open_tasks=[
+            _task(10, 1_700_000_000, "Связаться с клиентом по итогам звонка (AI)")
+        ])
+        with patch("services.amocrm.httpx.AsyncClient", fake):
+            result = await AmoCRMService().ensure_task(
+                lead_id=1, text="Отправить КП", complete_till=1_800_000_000,
+            )
+
+        self.assertEqual(result, {"action": "updated", "task_id": 10})
+
+
 class TestFollowupTaskDecision(unittest.IsolatedAsyncioTestCase):
     """Правило 2: задача по звонку — только при договорённости."""
 
@@ -242,8 +299,14 @@ class TestFollowupTaskDecision(unittest.IsolatedAsyncioTestCase):
 class TestParseTaskDecision(unittest.TestCase):
     """Разбор блока решения о задаче — fail-closed на любой кривизне."""
 
-    def test_missing_field_means_no_task(self):
-        self.assertEqual(_parse_task_decision({}), (False, "", DEFAULT_TASK_DUE_HOURS))
+    def test_missing_field_is_undecided_not_false(self):
+        """Блока нет → None, чтобы включилось запасное правило по next_steps."""
+        self.assertEqual(_parse_task_decision({}), (None, "", DEFAULT_TASK_DUE_HOURS))
+
+    def test_explicit_false_means_no_task(self):
+        self.assertEqual(
+            _parse_task_decision({"needs_task": False}), (False, "", DEFAULT_TASK_DUE_HOURS)
+        )
 
     def test_true_without_text_means_no_task(self):
         self.assertEqual(
@@ -266,6 +329,82 @@ class TestParseTaskDecision(unittest.TestCase):
                     {"needs_task": True, "task_text": "Отправить КП", "due_in_hours": raw}
                 )
                 self.assertEqual(hours, DEFAULT_TASK_DUE_HOURS)
+
+
+class TestFollowupFallbackRule(unittest.IsolatedAsyncioTestCase):
+    """
+    Запасное правило: LLM не вернул needs_task → решаем по next_steps.
+    Четыре сценария из задания, сквозь _create_followup_task.
+    """
+
+    @staticmethod
+    def _analysis(next_steps=None, next_contact="Не обсуждали"):
+        # needs_task=None — блока решения в ответе LLM не было
+        return SimpleNamespace(
+            needs_task=None, task_text="", due_in_hours=DEFAULT_TASK_DUE_HOURS,
+            next_contact_date=next_contact, next_steps=next_steps or [],
+        )
+
+    async def _run(self, analysis, open_tasks=None):
+        fake = FakeAmo(open_tasks=open_tasks or [])
+        spies = {}
+        with patch("services.amocrm.httpx.AsyncClient", fake), \
+                patch.object(main.amocrm_service, "create_task",
+                             wraps=main.amocrm_service.create_task) as create_spy, \
+                patch.object(main.amocrm_service, "update_task",
+                             wraps=main.amocrm_service.update_task) as update_spy:
+            await main._create_followup_task(1, analysis, 222)
+            spies["create"] = create_spy
+            spies["update"] = update_spy
+        return fake, spies
+
+    async def test_no_manager_steps_and_no_contact_creates_nothing(self):
+        analysis = self._analysis(next_steps=["Получить от клиента выписку"])
+        fake, spies = await self._run(analysis)
+
+        spies["create"].assert_not_called()
+        spies["update"].assert_not_called()
+        self.assertEqual(fake.requests, [], "к amoCRM не должно быть ни одного запроса")
+
+    async def test_manager_step_creates_task(self):
+        analysis = self._analysis(next_steps=["Менеджеру: отправить КП"])
+        fake, spies = await self._run(analysis)
+
+        spies["create"].assert_called_once()
+        spies["update"].assert_not_called()
+        payload = fake.by_method("POST")[0][1]["json"][0]
+        self.assertIn("отправить КП", payload["text"])
+        self.assertTrue(
+            payload["text"].startswith(main.AUTO_TASK_MARKER),
+            "без маркера авторства сервис потом примет свою задачу за ручную",
+        )
+
+    async def test_named_contact_date_alone_creates_task(self):
+        """Договорённость может быть только о времени звонка — это тоже задача."""
+        analysis = self._analysis(next_steps=[], next_contact="в пятницу")
+        fake, spies = await self._run(analysis)
+
+        spies["create"].assert_called_once()
+        payload = fake.by_method("POST")[0][1]["json"][0]
+        self.assertIn("перезвонить в пятницу", payload["text"])
+
+    async def test_existing_auto_task_is_updated_not_duplicated(self):
+        analysis = self._analysis(next_steps=["Менеджеру: отправить КП"])
+        fake, spies = await self._run(analysis, open_tasks=[_task(10, 1_700_000_000, AUTO_TEXT)])
+
+        spies["update"].assert_called_once()
+        spies["create"].assert_not_called()
+        self.assertEqual(fake.by_method("POST"), [])
+        self.assertTrue(fake.by_method("PATCH")[0][0].endswith("/tasks/10"))
+
+    async def test_existing_manual_task_stops_everything(self):
+        analysis = self._analysis(next_steps=["Менеджеру: отправить КП"])
+        fake, spies = await self._run(analysis, open_tasks=[_task(10, 1_700_000_000, MANUAL_TEXT)])
+
+        spies["create"].assert_not_called()
+        spies["update"].assert_not_called()
+        self.assertEqual(fake.by_method("POST"), [])
+        self.assertEqual(fake.by_method("PATCH"), [])
 
 
 class TestAnalysisWiring(unittest.IsolatedAsyncioTestCase):
@@ -299,7 +438,7 @@ class TestAnalysisWiring(unittest.IsolatedAsyncioTestCase):
         }, ensure_ascii=False))
 
         self.assertEqual(analysis.summary, "консультация")
-        self.assertFalse(analysis.needs_task)
+        self.assertIsNone(analysis.needs_task, "должно быть «не высказался», а не «нет»")
         self.assertEqual(analysis.task_text, "")
 
 
