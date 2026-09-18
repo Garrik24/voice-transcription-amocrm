@@ -1602,6 +1602,27 @@ async def test_telegram():
     return {"telegram_ok": ok}
 
 
+# Звонки в webhook amoCRM: 10 — входящий, 11 — исходящий (в API v4 — call_in/call_out)
+CALL_NOTE_TYPES = {"10", "11", "call_in", "call_out"}
+
+
+def is_call_note_type(note_type) -> bool:
+    """Может ли примечание из webhook быть звонком.
+
+    Раньше сервис запрашивал в amoCRM каждое новое примечание и только потом
+    смотрел тип. Когда примечаний появляется много разом — например, amoCRM
+    подтягивает старую переписку в только что созданный контакт (письма,
+    тип 15), — запрос на каждое упирается в лимит amoCRM. 18.09.2026 так
+    заблокировали IP сервиса, и расшифровка звонков встала.
+
+    Тип не пришёл — считаем, что может быть звонком, и проверяем как раньше:
+    лучше лишний запрос, чем потерянный звонок.
+    """
+    if note_type is None or str(note_type).strip() == "":
+        return True
+    return str(note_type).strip() in CALL_NOTE_TYPES
+
+
 @app.post("/webhook/amocrm")
 async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
     """
@@ -1674,7 +1695,15 @@ async def amocrm_webhook(request: Request, background_tasks: BackgroundTasks):
         
         # Логируем извлечённые данные для отладки
         logger.info(f"📋 Извлечено: note_id={note_id}, element_id={element_id}, entity={entity_type}, note_type={note_type}")
-        
+
+        # 3a. Тип примечания приходит прямо в webhook — не звонки отсекаем без
+        #     запроса в amoCRM (см. is_call_note_type)
+        if not is_call_note_type(note_type):
+            return JSONResponse(
+                content={"status": "ignored", "reason": "not_a_call", "note_type": note_type},
+                status_code=200,
+            )
+
         # 4. Получаем данные примечания
         note_data = None
         
