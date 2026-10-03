@@ -3,6 +3,7 @@
 Замена GPT-4.1-mini / Gemini → Claude Sonnet 4.6.
 Интерфейс (CallAnalysis, AnalysisService, format_note) сохранён для совместимости с main.py.
 """
+import contextvars
 import anthropic
 import httpx
 import json
@@ -68,6 +69,21 @@ def _normalize_list_field(value) -> List[str]:
     # fallback
     s = str(value).strip()
     return [s] if s else []
+
+
+# Провайдер/модель, фактически ответившие на последний LLM-запрос в текущем
+# потоке выполнения. Нужен format_note: при фолбэке в заметке должен стоять
+# реальный провайдер, а не основной по настройке.
+_llm_used: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("llm_used", default=None)
+
+
+def _llm_label(provider: str) -> str:
+    model = {
+        "anthropic": ANTHROPIC_MODEL,
+        "assemblyai": ASSEMBLYAI_LLM_MODEL,
+        "openai": OPENAI_MODEL,
+    }.get(provider)
+    return f"{provider}/{model}" if model else provider
 
 
 def _get_anthropic_client() -> anthropic.AsyncAnthropic:
@@ -815,6 +831,7 @@ class AnalysisService:
                 continue
             try:
                 text = await caller(system_prompt, user_prompt, max_tokens)
+                _llm_used.set(_llm_label(provider))
                 await self._llm_recovered(provider)
                 return text
             except Exception as exc:
@@ -828,6 +845,7 @@ class AnalysisService:
         for provider in skipped:
             try:
                 text = await callers[provider](system_prompt, user_prompt, max_tokens)
+                _llm_used.set(_llm_label(provider))
                 await self._llm_recovered(provider)
                 return text
             except Exception as exc:
@@ -1150,7 +1168,7 @@ class AnalysisService:
             else:
                 call_direction_context = "Это ВХОДЯЩИЙ звонок — клиент позвонил в компанию."
 
-            logger.info(f"🤖 Анализ через anthropic/{ANTHROPIC_MODEL}")
+            logger.info(f"🤖 Анализ: цепочка LLM {' → '.join(LLM_CHAIN)}")
 
             # Адаптируем max_tokens в зависимости от длины звонка
             if is_long_call:
@@ -1305,7 +1323,7 @@ class AnalysisService:
         duration_str = f"{minutes} мин {seconds} сек" if minutes else f"{seconds} сек"
         call_type_str = "Исходящий" if call_type == "outgoing" else "Входящий"
 
-        model_name = model_used or f"anthropic/{ANTHROPIC_MODEL}"
+        model_name = model_used or _llm_used.get() or _llm_label(LLM_CHAIN[0] if LLM_CHAIN else "anthropic")
 
         stt_label = (stt_provider or "assemblyai").strip().lower()
         stt_display = {"whisper": "Whisper", "assemblyai": "AssemblyAI", "yandex": "Yandex"}.get(stt_label, stt_label)

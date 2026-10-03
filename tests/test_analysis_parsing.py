@@ -128,3 +128,28 @@ class TestV2Helpers(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class TestNoteProvider(unittest.IsolatedAsyncioTestCase):
+    async def test_note_shows_fallback_provider(self):
+        """Anthropic упал по балансу → в заметке реальный провайдер (AssemblyAI)."""
+        from unittest.mock import AsyncMock, patch
+        from services import analysis as mod
+
+        svc = mod.AnalysisService()
+        svc._call_anthropic = AsyncMock(side_effect=RuntimeError("credit balance is too low"))
+        svc._call_assemblyai_llm = AsyncMock(return_value="ok")
+        svc._llm_mark_down = AsyncMock()
+        svc._llm_recovered = AsyncMock()
+
+        with patch.object(mod, "LLM_CHAIN", ["anthropic", "assemblyai"]), \
+             patch.object(mod, "LLM_FALLBACK_ENABLED", True), \
+             patch.object(AnalysisService := mod.AnalysisService, "_is_llm_infra_failure", staticmethod(lambda e: True)):
+            self.assertEqual(await svc._call_llm("s", "u"), "ok")
+            note = svc.format_note(mod.CallAnalysis(
+                client_name="К", manager_name="М", summary="с", client_city="-", location="-",
+                work_type="-", cost="-", payment_terms="-", call_result="-",
+                next_contact_date="-", next_steps=[],
+            ))
+        self.assertIn(f"[assemblyai/{mod.ASSEMBLYAI_LLM_MODEL} |", note)
+        self.assertNotIn("[anthropic/", note)
