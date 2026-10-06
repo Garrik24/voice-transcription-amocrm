@@ -123,6 +123,7 @@ class TelegramService:
         call_result: str = "Не определено",
         next_contact_date: str = "Не указано",
         next_steps: Optional[List[str]] = None,
+        engine_note: str = "",
     ) -> bool:
         """
         Отправляет красивый анализ звонка в Telegram.
@@ -134,7 +135,8 @@ class TelegramService:
         if next_steps:
             steps_block = "\n\n✅ <b>Следующие шаги:</b>\n" + "\n".join([f"- {s}" for s in next_steps])
         
-        text = f"""📊 <b>АНАЛИЗ ЗВОНКА</b>
+        engine_line = f" <i>({engine_note})</i>" if engine_note else ""
+        text = f"""📊 <b>АНАЛИЗ ЗВОНКА</b>{engine_line}
 
 📅 {call_datetime}
 📞 {call_type_str}

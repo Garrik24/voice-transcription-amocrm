@@ -32,6 +32,7 @@ from config import (
     OPENAI_API_KEY,
     STEREO_TEXT_FROM_MONO,
     STT_FALLBACK_ENABLED,
+    FALLBACK_NOTIFICATIONS,
     STT_FALLBACK_RETRY_MINUTES,
 )
 from services.telegram import telegram_service
@@ -174,6 +175,8 @@ class TranscriptionService:
         if already:
             return
         logger.error(f"🔁 Whisper недоступен ({exc}) — переключаемся на AssemblyAI")
+        if not FALLBACK_NOTIFICATIONS:
+            return
         try:
             await telegram_service.send_message(
                 "🔁 <b>Переключение на резервный STT</b>\n\n"
@@ -189,6 +192,8 @@ class TranscriptionService:
         """Основной провайдер ожил — снимаем режим резерва и сообщаем владельцу."""
         self._fallback_until = 0.0
         logger.info("✅ Whisper снова доступен — вернулись с резерва")
+        if not FALLBACK_NOTIFICATIONS:
+            return
         try:
             await telegram_service.send_message(
                 "✅ <b>Whisper снова работает</b>\n\n"

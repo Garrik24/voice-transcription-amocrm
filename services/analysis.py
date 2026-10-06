@@ -19,6 +19,7 @@ from config import (
     ANTHROPIC_MODEL,
     ASSEMBLYAI_API_KEY,
     ASSEMBLYAI_LLM_MODEL,
+    FALLBACK_NOTIFICATIONS,
     GEMINI_API_KEY,
     GEMINI_LLM_MODEL,
     LLM_CHAIN,
@@ -78,6 +79,16 @@ def _normalize_list_field(value) -> List[str]:
 # потоке выполнения. Нужен format_note: при фолбэке в заметке должен стоять
 # реальный провайдер, а не основной по настройке.
 _llm_used: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("llm_used", default=None)
+
+
+# Короткие названия для строки «чем разобран звонок» в сводке Telegram
+LLM_SHORT_TITLES = {
+    "anthropic": "Claude API",
+    "assemblyai": "AssemblyAI",
+    "gemini": "Gemini",
+    "openai": "OpenAI",
+}
+STT_SHORT_TITLES = {"whisper": "Whisper", "assemblyai": "AssemblyAI", "yandex": "Yandex"}
 
 
 def _llm_label(provider: str) -> str:
@@ -778,6 +789,8 @@ class AnalysisService:
         nxt = [p for p in LLM_CHAIN if p != provider and self._llm_available(p)]
         target = LLM_PROVIDER_TITLES.get(nxt[0], nxt[0]) if nxt else "—"
         logger.error(f"🔁 LLM {provider} недоступен ({exc}) — переходим на {target}")
+        if not FALLBACK_NOTIFICATIONS:
+            return
         try:
             await telegram_service.send_message(
                 "🔁 <b>Переключение анализа на резерв</b>\n\n"
@@ -794,6 +807,8 @@ class AnalysisService:
         if not self._llm_down_until.pop(provider, None):
             return
         logger.info(f"✅ LLM {provider} снова доступен")
+        if not FALLBACK_NOTIFICATIONS:
+            return
         try:
             await telegram_service.send_message(
                 "✅ <b>Анализ вернулся на основной провайдер</b>\n\n"
@@ -1359,6 +1374,14 @@ class AnalysisService:
         except Exception as e:
             logger.error(f"Ошибка анализа: {e}")
             raise
+
+    def engine_note(self, stt_provider: Optional[str] = None) -> str:
+        """Чем разобран звонок: «анализ: AssemblyAI · речь: AssemblyAI» — для сводки в Telegram."""
+        used = _llm_used.get() or _llm_label(LLM_CHAIN[0] if LLM_CHAIN else "anthropic")
+        llm = LLM_SHORT_TITLES.get(used.split("/")[0], used.split("/")[0])
+        stt_key = (stt_provider or "assemblyai").strip().lower()
+        stt = STT_SHORT_TITLES.get(stt_key, stt_key)
+        return f"анализ: {llm} · речь: {stt}"
 
     def format_note(
         self,

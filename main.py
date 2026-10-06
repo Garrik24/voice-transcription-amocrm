@@ -1555,6 +1555,7 @@ async def process_call(
             call_result=analysis.call_result,
             next_contact_date=analysis.next_contact_date,
             next_steps=analysis.next_steps,
+            engine_note=analysis_service.engine_note(getattr(transcription, "stt_provider", STT_PROVIDER)),
         )
         if not tg_ok:
             logger.warning(f"⚠️ Telegram: уведомление не отправлено (проверьте TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID)")
@@ -1964,6 +1965,7 @@ async def process_uploaded_audio(
             call_result=analysis.call_result,
             next_contact_date=analysis.next_contact_date,
             next_steps=analysis.next_steps,
+            engine_note=analysis_service.engine_note(getattr(transcription, "stt_provider", STT_PROVIDER)),
         )
         if not tg_ok:
             logger.warning(f"⚠️ Telegram: уведомление не отправлено (проверьте TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID)")
