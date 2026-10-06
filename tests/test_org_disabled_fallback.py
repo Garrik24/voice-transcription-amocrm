@@ -121,3 +121,75 @@ class GeminiCall(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuietFallbackNotifications(unittest.IsolatedAsyncioTestCase):
+    async def test_switch_message_not_sent_by_default(self):
+        from services import analysis as mod
+
+        svc = mod.AnalysisService()
+        with patch.object(mod, "FALLBACK_NOTIFICATIONS", False), patch.object(
+            mod.telegram_service, "send_message", new=AsyncMock()
+        ) as send:
+            await svc._llm_mark_down("anthropic", RuntimeError("down"))
+            await svc._llm_recovered("anthropic")
+        send.assert_not_called()
+
+    async def test_switch_message_sent_when_enabled(self):
+        from services import analysis as mod
+
+        svc = mod.AnalysisService()
+        with patch.object(mod, "FALLBACK_NOTIFICATIONS", True), patch.object(
+            mod.telegram_service, "send_message", new=AsyncMock()
+        ) as send:
+            await svc._llm_mark_down("anthropic", RuntimeError("down"))
+        send.assert_called_once()
+
+    async def test_stt_switch_message_not_sent_by_default(self):
+        from services import transcription as mod
+
+        svc = mod.TranscriptionService()
+        with patch.object(mod, "FALLBACK_NOTIFICATIONS", False), patch.object(
+            mod.telegram_service, "send_message", new=AsyncMock()
+        ) as send:
+            await svc._activate_fallback(RuntimeError("401"))
+            await svc._deactivate_fallback()
+        send.assert_not_called()
+
+
+class EngineNote(unittest.IsolatedAsyncioTestCase):
+    async def test_note_names_actual_providers(self):
+        from services import analysis as mod
+
+        svc = mod.AnalysisService()
+        svc._llm_mark_down = AsyncMock()
+        svc._llm_recovered = AsyncMock()
+        svc._call_anthropic = AsyncMock(side_effect=anthropic_error(400, ORG_DISABLED, "organization_on_hold"))
+        svc._call_assemblyai_llm = AsyncMock(return_value="ok")
+        with patch.object(mod, "LLM_CHAIN", ["anthropic", "assemblyai"]), patch.object(mod, "LLM_FALLBACK_ENABLED", True):
+            await svc._call_llm("s", "u")
+            self.assertEqual(svc.engine_note("assemblyai"), "анализ: AssemblyAI · речь: AssemblyAI")
+            self.assertEqual(svc.engine_note("whisper"), "анализ: AssemblyAI · речь: Whisper")
+
+    async def test_telegram_summary_header_contains_note(self):
+        from services.telegram import TelegramService
+
+        tg = TelegramService()
+        tg.send_message = AsyncMock(return_value=True)
+        await tg.send_call_analysis(
+            call_datetime="06.10.2026 10:00", call_type="incoming", phone="+7", manager_name="М",
+            client_name="К", summary="с", amocrm_url="https://x", engine_note="анализ: AssemblyAI · речь: AssemblyAI",
+        )
+        text = tg.send_message.call_args[0][0]
+        self.assertIn("АНАЛИЗ ЗВОНКА</b> <i>(анализ: AssemblyAI · речь: AssemblyAI)</i>", text)
+
+    async def test_telegram_summary_without_note_unchanged(self):
+        from services.telegram import TelegramService
+
+        tg = TelegramService()
+        tg.send_message = AsyncMock(return_value=True)
+        await tg.send_call_analysis(
+            call_datetime="d", call_type="incoming", phone="+7", manager_name="М",
+            client_name="К", summary="с", amocrm_url="https://x",
+        )
+        self.assertTrue(tg.send_message.call_args[0][0].startswith("📊 <b>АНАЛИЗ ЗВОНКА</b>\n"))

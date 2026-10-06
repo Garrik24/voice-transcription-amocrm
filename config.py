@@ -146,6 +146,13 @@ ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "true").strip().lower() == "true"
 # Минимальный интервал между повторными алертами одного класса, минут
 ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "30"))
 
+# Отдельные сообщения о переключении на резервного провайдера (LLM и STT) и о
+# возврате на основного. При долгой недоступности основного они приходили заново
+# каждые полчаса (бот раз в LLM_FALLBACK_RETRY_MINUTES / STT_FALLBACK_RETRY_MINUTES
+# пробует основного снова). По умолчанию выключены: какой провайдер ответил,
+# видно в самой сводке звонка в Telegram и в заметке amoCRM. true — вернуть сообщения.
+FALLBACK_NOTIFICATIONS = os.getenv("FALLBACK_NOTIFICATIONS", "false").strip().lower() == "true"
+
 # ============== Приложение ==============
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 PORT = int(os.getenv("PORT", 8000))

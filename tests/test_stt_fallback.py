@@ -42,6 +42,12 @@ class TestSttFallback(unittest.IsolatedAsyncioTestCase):
         self._key_patch = patch("services.transcription.ASSEMBLYAI_API_KEY", "test-aai-key")
         self._key_patch.start()
         self.addCleanup(self._key_patch.stop)
+        # Эти тесты проверяют сам механизм уведомлений, поэтому включают их:
+        # по умолчанию сообщения о переключении выключены (FALLBACK_NOTIFICATIONS=false),
+        # это покрыто в test_org_disabled_fallback.py.
+        self._notify_patch = patch("services.transcription.FALLBACK_NOTIFICATIONS", True)
+        self._notify_patch.start()
+        self.addCleanup(self._notify_patch.stop)
 
     async def test_normal_path_uses_whisper(self):
         with patch.object(self.svc, "_whisper_with_segments", new=AsyncMock(return_value=WHISPER_OUT)), \
