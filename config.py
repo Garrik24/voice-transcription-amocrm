@@ -56,14 +56,14 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 # ключ — автоматически переходим к следующему, уведомляя в Telegram. Через
 # LLM_FALLBACK_RETRY_MINUTES пробуем вернуться на основной.
 #
-# Порядок по умолчанию: anthropic → assemblyai → openai.
+# Порядок по умолчанию: anthropic → assemblyai → gemini → openai.
 # assemblyai здесь — не распознавание речи, а LLM Gateway AssemblyAI
 # (llm-gateway.assemblyai.com), где доступна та же модель claude-sonnet-4-6,
 # что и у Anthropic напрямую. Поэтому качество сводок при переключении
 # не падает, а оплата идёт с баланса AssemblyAI.
 LLM_CHAIN = [
     p.strip().lower()
-    for p in os.getenv("LLM_CHAIN", "anthropic,assemblyai,openai").split(",")
+    for p in os.getenv("LLM_CHAIN", "anthropic,assemblyai,gemini,openai").split(",")
     if p.strip()
 ]
 
@@ -85,6 +85,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # Google Gemini (google-genai SDK)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-001")
+# Модель Gemini для анализа звонков в цепочке LLM (REST generateContent).
+GEMINI_LLM_MODEL = os.getenv("GEMINI_LLM_MODEL", "gemini-3.7-flash")
 
 # ============== AI Analysis Settings ==============
 # Максимальное количество токенов для ответа (увеличено для длинных звонков)

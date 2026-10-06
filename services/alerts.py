@@ -53,6 +53,11 @@ QUOTA_HINTS = (
     "quota",
 )
 AUTH_CODES = {"invalid_api_key", "account_deactivated", "invalid_authentication"}
+# Организация отключена целиком (Anthropic: 400 «This organization has been
+# disabled», error_code organization_on_hold). Ключ при этом «валиден», но
+# запросы не проходят, пока организацию не разблокируют, — как и при пустом
+# балансе, нужно переходить к следующему провайдеру.
+ORG_DISABLED_HINTS = ("organization has been disabled", "organization_on_hold")
 
 
 def _is_quota(code: Optional[str], type_: Optional[str], message: str) -> bool:
@@ -94,6 +99,9 @@ def classify(exc: BaseException) -> Optional[Tuple[str, str, str]]:
 
         if status == 401 or code in AUTH_CODES:
             return (KIND_AUTH, provider, auth_text)
+        full_text = f"{message} {exc}".lower()
+        if any(h in full_text for h in ORG_DISABLED_HINTS):
+            return (KIND_AUTH, provider, f"Организация {provider} отключена (на проверке) — запросы к {provider} не проходят.")
         if _is_quota(code, type_, message):
             return (KIND_QUOTA, provider, quota_text)
         # Прочие 429 — обычный rate limit, SDK ретраит сам. Не алертим.
