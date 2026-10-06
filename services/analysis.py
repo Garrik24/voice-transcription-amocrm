@@ -19,6 +19,8 @@ from config import (
     ANTHROPIC_MODEL,
     ASSEMBLYAI_API_KEY,
     ASSEMBLYAI_LLM_MODEL,
+    GEMINI_API_KEY,
+    GEMINI_LLM_MODEL,
     LLM_CHAIN,
     LLM_FALLBACK_ENABLED,
     LLM_FALLBACK_RETRY_MINUTES,
@@ -40,6 +42,7 @@ _openai_client: "openai.AsyncOpenAI | None" = None
 LLM_PROVIDER_TITLES = {
     "anthropic": "Anthropic (Claude)",
     "assemblyai": "AssemblyAI (Claude через их шлюз)",
+    "gemini": "Google Gemini",
     "openai": "OpenAI (GPT)",
 }
 
@@ -81,6 +84,7 @@ def _llm_label(provider: str) -> str:
     model = {
         "anthropic": ANTHROPIC_MODEL,
         "assemblyai": ASSEMBLYAI_LLM_MODEL,
+        "gemini": GEMINI_LLM_MODEL,
         "openai": OPENAI_MODEL,
     }.get(provider)
     return f"{provider}/{model}" if model else provider
@@ -816,6 +820,7 @@ class AnalysisService:
         callers = {
             "anthropic": self._call_anthropic,
             "assemblyai": self._call_assemblyai_llm,
+            "gemini": self._call_gemini_llm,
             "openai": self._call_openai_llm,
         }
 
@@ -898,6 +903,55 @@ class AnalysisService:
             f"{usage.get('input_tokens', '?')} in / {usage.get('output_tokens', '?')} out"
         )
         return data["choices"][0]["message"]["content"]
+
+    async def _call_gemini_llm(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+        """
+        Google Gemini (generateContent, REST). Нужен, когда Anthropic и OpenAI
+        недоступны: у Gemini свой аккаунт и баланс.
+
+        Размышления Gemini 3 делят лимит maxOutputTokens с текстом ответа, поэтому
+        к лимиту добавляется запас, а глубина размышлений ограничена (low).
+        """
+        if not GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY не задан")
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_LLM_MODEL}:generateContent",
+                headers={"x-goog-api-key": GEMINI_API_KEY},
+                json={
+                    "system_instruction": {"parts": [{"text": system_prompt}]},
+                    "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": max_tokens + 4000,
+                        "thinkingConfig": {"thinkingLevel": "low"},
+                    },
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise RuntimeError(f"Gemini не вернул ответ: {(data.get('promptFeedback') or {})}")
+        candidate = candidates[0]
+        if candidate.get("finishReason") == "MAX_TOKENS":
+            raise ValueError("ответ Gemini обрезан по лимиту токенов")
+        # Блоки размышления помечены thought: true — в ответ они не идут.
+        text = "".join(
+            part.get("text", "")
+            for part in (candidate.get("content") or {}).get("parts", [])
+            if part.get("text") and not part.get("thought")
+        ).strip()
+        if not text:
+            raise ValueError(f"Gemini вернул ответ без текста (finishReason: {candidate.get('finishReason')})")
+
+        usage = data.get("usageMetadata") or {}
+        logger.info(
+            f"LLM gemini/{GEMINI_LLM_MODEL}: "
+            f"{usage.get('promptTokenCount', '?')} in / {usage.get('candidatesTokenCount', '?')} out"
+        )
+        return text
 
     async def _call_openai_llm(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
         """OpenAI напрямую — последнее звено цепочки."""
