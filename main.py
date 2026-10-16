@@ -1108,9 +1108,21 @@ def _chat_source_name(origin: str) -> str | None:
     return None
 
 
+# Ключ к REST API mcp-amocrm-server (/api/* закрыт API_SECRET_KEY на стороне сервера).
+AMOCRM_API_KEY = os.getenv("AMOCRM_API_KEY", "").strip()
+
+
 async def _fetch_chat_json(path: str) -> dict:
+    headers = {}
+    if AMOCRM_API_KEY:
+        headers["X-API-Key"] = AMOCRM_API_KEY
     async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(f"{CHAT_STORAGE_URL}{path}")
+        response = await client.get(f"{CHAT_STORAGE_URL}{path}", headers=headers)
+        if response.status_code in (401, 403):
+            logger.error(
+                f"❌ Chat API {path.split('?')[0]} → {response.status_code}: "
+                "проверьте AMOCRM_API_KEY (должен совпадать с API_SECRET_KEY mcp-amocrm-server)"
+            )
         response.raise_for_status()
         return response.json()
 
