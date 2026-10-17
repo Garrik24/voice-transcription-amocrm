@@ -1,5 +1,6 @@
 """
-Бэкфилл нерасшифрованных звонков за текущую неделю (пн 00:00 МСК → сейчас).
+Бэкфилл нерасшифрованных звонков за текущую неделю (пн 00:00 МСК → сейчас)
+или с даты BACKFILL_FROM=ГГГГ-ММ-ДД (00:00 МСК), если простой начался раньше понедельника.
 
 Зачем: при простое STT (429 insufficient_quota) звонки скачиваются, но падают
 на транскрибации. Вебхуки AmoCRM не повторяются — переобрабатываем вручную.
@@ -59,11 +60,16 @@ TYPE_MAP = {
 
 
 def week_bounds():
+    """Окно бэкфилла: с понедельника этой недели или с BACKFILL_FROM=ГГГГ-ММ-ДД (00:00 МСК)."""
     now_msk = datetime.now(MSK)
-    monday = (now_msk - timedelta(days=now_msk.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    return monday.timestamp(), (datetime.now(timezone.utc) - timedelta(minutes=5)).timestamp()
+    start_env = os.getenv("BACKFILL_FROM", "").strip()
+    if start_env:
+        start = datetime.strptime(start_env, "%Y-%m-%d").replace(tzinfo=MSK)
+    else:
+        start = (now_msk - timedelta(days=now_msk.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    return start.timestamp(), (datetime.now(timezone.utc) - timedelta(minutes=5)).timestamp()
 
 
 async def _get(client, url, params):
